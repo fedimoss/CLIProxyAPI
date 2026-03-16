@@ -18,6 +18,7 @@ import (
 
 	"gitee.com/chunanyong/zorm"
 	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
 	configaccess "github.com/router-for-me/CLIProxyAPI/v6/internal/access/config_access"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/cmd"
