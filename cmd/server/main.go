@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"gitee.com/chunanyong/zorm"
 	"github.com/joho/godotenv"
 	configaccess "github.com/router-for-me/CLIProxyAPI/v6/internal/access/config_access"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo"
@@ -48,6 +49,29 @@ func init() {
 	buildinfo.Version = Version
 	buildinfo.Commit = Commit
 	buildinfo.BuildDate = BuildDate
+}
+
+// initDB 初始化数据库连接
+func initDB(cfg *config.Config) error {
+	dbDaoConfig := zorm.DataSourceConfig{
+		DSN:                   cfg.Database.DSN,
+		DriverName:            cfg.Database.DriverName,
+		Dialect:               cfg.Database.Dialect,
+		MaxOpenConns:          cfg.Database.MaxOpenConns,
+		MaxIdleConns:          cfg.Database.MaxIdleConns,
+		ConnMaxLifetimeSecond: cfg.Database.ConnMaxLifetimeSecond,
+		SlowSQLMillis:         cfg.Database.SlowSQLMillis,
+	}
+
+	dbDao, err := zorm.NewDBDao(&dbDaoConfig)
+	if err != nil {
+		return fmt.Errorf("数据库初始化失败: %w", err)
+	}
+
+	log.Infof("数据库已连接")
+	_ = dbDao
+
+	return nil
 }
 
 // main is the entry point of the application.
@@ -435,6 +459,12 @@ func main() {
 		cfg.AuthDir = resolvedAuthDir
 	}
 	managementasset.SetCurrentConfig(cfg)
+
+	// Initialize database connection
+	if err := initDB(cfg); err != nil {
+		log.Errorf("failed to initialize database: %v", err)
+		return
+	}
 
 	// Create login options to be used in authentication flows.
 	options := &cmd.LoginOptions{

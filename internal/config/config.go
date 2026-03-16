@@ -125,6 +125,9 @@ type Config struct {
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
+	// Database holds PostgreSQL database connection configuration.
+	Database DatabaseConfig `yaml:"database" json:"database"`
+
 	legacyMigrationPending bool `yaml:"-" json:"-"`
 }
 
@@ -191,6 +194,17 @@ type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "fill-first".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+}
+
+// DatabaseConfig PostgreSQL数据库配置
+type DatabaseConfig struct {
+	DSN                   string `yaml:"dsn" json:"dsn"`                                           // 数据源连接字符串
+	DriverName            string `yaml:"driver-name" json:"driver-name"`                           // 数据库驱动名称
+	Dialect               string `yaml:"dialect" json:"dialect"`                                   // 数据库方言
+	MaxOpenConns          int    `yaml:"max-open-conns" json:"max-open-conns"`                     // 最大连接数
+	MaxIdleConns          int    `yaml:"max-idle-conns" json:"max-idle-conns"`                     // 最大空闲连接数
+	ConnMaxLifetimeSecond int    `yaml:"conn-max-lifetime-second" json:"conn-max-lifetime-second"` // 连接最大存活时间(秒)
+	SlowSQLMillis         int    `yaml:"slow-sql-millis" json:"slow-sql-millis"`                   // 慢SQL阈值(毫秒)
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.

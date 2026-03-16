@@ -3,6 +3,7 @@ module github.com/router-for-me/CLIProxyAPI/v6
 go 1.26.0
 
 require (
+	gitee.com/chunanyong/zorm v1.8.3
 	github.com/andybalholm/brotli v1.0.6
 	github.com/atotto/clipboard v0.1.4
 	github.com/charmbracelet/bubbles v1.0.0

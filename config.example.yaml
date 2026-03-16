@@ -356,3 +356,14 @@ nonstream-keepalive-interval: 0
 #       params: # JSON paths (gjson/sjson syntax) to remove from the payload
 #         - "generationConfig.thinkingConfig.thinkingBudget"
 #         - "generationConfig.responseJsonSchema"
+
+
+# PostgreSQL数据库配置
+database:
+  dsn: "host=127.0.0.1 port=5432 user=postgres password= dbname=your_database sslmode=disable" # 数据源连接字符串
+  driver-name: "postgres"              # 数据库驱动名称
+  dialect: "postgresql"                # 数据库方言
+  max-open-conns: 50                   # 最大连接数
+  max-idle-conns: 50                   # 最大空闲连接数
+  conn-max-lifetime-second: 600        # 连接最大存活时间(秒)
+  slow-sql-millis: 0                   # 慢SQL阈值(毫秒)，<0禁用，=0仅输出SQL，>0计算执行时间
