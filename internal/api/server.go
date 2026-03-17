@@ -277,12 +277,13 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s.setupRoutes()
 
 	// Register Amp module using V2 interface with Context
-	s.ampModule = ampmodule.NewLegacy(accessManager, AuthMiddleware(accessManager))
+	authAndPin := chainMiddleware(AuthMiddleware(accessManager), UserOAuthPinMiddleware())
+	s.ampModule = ampmodule.NewLegacy(accessManager, authAndPin)
 	ctx := modules.Context{
 		Engine:         engine,
 		BaseHandler:    s.handlers,
 		Config:         cfg,
-		AuthMiddleware: AuthMiddleware(accessManager),
+		AuthMiddleware: authAndPin,
 	}
 	if err := modules.RegisterModule(ctx, s.ampModule); err != nil {
 		log.Errorf("Failed to register Amp module: %v", err)
@@ -327,6 +328,7 @@ func (s *Server) setupRoutes() {
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
 	v1.Use(AuthMiddleware(s.accessManager))
+	v1.Use(UserOAuthPinMiddleware())
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
@@ -341,6 +343,7 @@ func (s *Server) setupRoutes() {
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")
 	v1beta.Use(AuthMiddleware(s.accessManager))
+	v1beta.Use(UserOAuthPinMiddleware())
 	{
 		v1beta.GET("/models", geminiHandlers.GeminiModels)
 		v1beta.POST("/models/*action", geminiHandlers.GeminiHandler)
@@ -458,6 +461,7 @@ func (s *Server) AttachWebsocketRoute(path string, handler http.Handler) {
 	s.wsRouteMu.Unlock()
 
 	authMiddleware := AuthMiddleware(s.accessManager)
+	userOAuthPin := UserOAuthPinMiddleware()
 	conditionalAuth := func(c *gin.Context) {
 		if !s.wsAuthEnabled.Load() {
 			c.Next()
@@ -465,12 +469,19 @@ func (s *Server) AttachWebsocketRoute(path string, handler http.Handler) {
 		}
 		authMiddleware(c)
 	}
+	conditionalPin := func(c *gin.Context) {
+		if !s.wsAuthEnabled.Load() {
+			c.Next()
+			return
+		}
+		userOAuthPin(c)
+	}
 	finalHandler := func(c *gin.Context) {
 		handler.ServeHTTP(c.Writer, c.Request)
 		c.Abort()
 	}
 
-	s.engine.GET(trimmed, conditionalAuth, finalHandler)
+	s.engine.GET(trimmed, conditionalAuth, conditionalPin, finalHandler)
 }
 
 func (s *Server) registerManagementRoutes() {
