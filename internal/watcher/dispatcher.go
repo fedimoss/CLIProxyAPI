@@ -81,6 +81,10 @@ func (w *Watcher) refreshAuthState(force bool) {
 	w.clientsMutex.RLock()
 	cfg := w.config
 	authDir := w.authDir
+	// 如果跳过文件 auth 扫描，则 authDir 为空
+	if w.skipFileAuth {
+		authDir = ""
+	}
 	w.clientsMutex.RUnlock()
 	auths := snapshotCoreAuthsFunc(cfg, authDir)
 	w.clientsMutex.Lock()

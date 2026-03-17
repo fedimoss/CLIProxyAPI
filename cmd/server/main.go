@@ -481,7 +481,12 @@ func main() {
 	} else if useGitStore {
 		sdkAuth.RegisterTokenStore(gitStoreInst)
 	} else {
-		sdkAuth.RegisterTokenStore(sdkAuth.NewFileTokenStore())
+		// 数据库优先：zorm 已初始化则使用 DBTokenStore，否则降级到 FileTokenStore
+		if cfg.Database.DSN != "" {
+			sdkAuth.RegisterTokenStore(store.NewDBTokenStore())
+		} else {
+			sdkAuth.RegisterTokenStore(sdkAuth.NewFileTokenStore())
+		}
 	}
 
 	// Register built-in access providers before constructing services.

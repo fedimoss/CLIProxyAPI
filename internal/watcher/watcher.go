@@ -28,10 +28,16 @@ type authDirProvider interface {
 	AuthDir() string
 }
 
+// fileAuthSkipper 由独立于文件系统管理 auth 的存储实现，Watcher 据此跳过文件扫描
+type fileAuthSkipper interface {
+	SkipFileAuth() bool
+}
+
 // Watcher manages file watching for configuration and authentication files
 type Watcher struct {
 	configPath        string
 	authDir           string
+	skipFileAuth      bool
 	config            *config.Config
 	clientsMutex      sync.RWMutex
 	configReloadMu    sync.Mutex
@@ -111,6 +117,10 @@ func NewWatcher(configPath, authDir string, reloadCallback func(*config.Config))
 				w.mirroredAuthDir = fixed
 				log.Debugf("mirrored auth directory locked to %s", fixed)
 			}
+		}
+		if skipper, ok := store.(fileAuthSkipper); ok && skipper.SkipFileAuth() {
+			w.skipFileAuth = true
+			log.Debug("检测到数据库 Token 存储，已禁用文件 auth 扫描")
 		}
 	}
 	return w, nil

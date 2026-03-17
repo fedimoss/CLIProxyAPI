@@ -33,15 +33,19 @@ func (w *Watcher) start(ctx context.Context) error {
 	}
 	log.Debugf("watching config file: %s", w.configPath)
 
-	if errAddAuthDir := w.watcher.Add(w.authDir); errAddAuthDir != nil {
-		log.Errorf("failed to watch auth directory %s: %v", w.authDir, errAddAuthDir)
-		return errAddAuthDir
+	// 如果跳过文件 auth 扫描，则不监控 authDir
+	if !w.skipFileAuth {
+		if errAddAuthDir := w.watcher.Add(w.authDir); errAddAuthDir != nil {
+			log.Errorf("failed to watch auth directory %s: %v", w.authDir, errAddAuthDir)
+			return errAddAuthDir
+		}
+		log.Debugf("watching auth directory: %s", w.authDir)
 	}
-	log.Debugf("watching auth directory: %s", w.authDir)
 
 	go w.processEvents(ctx)
 
-	w.reloadClients(true, nil, false)
+	// 初始化时刷新 auth 状态
+	w.reloadClients(!w.skipFileAuth, nil, false)
 	return nil
 }
 

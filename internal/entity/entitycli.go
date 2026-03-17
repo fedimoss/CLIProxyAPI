@@ -9,11 +9,11 @@ import (
 // CLIOauth 对应数据库 cli_oauth 表
 type CLIOauth struct {
 	zorm.EntityStruct
-	ID         string     `column:"id" json:"id"`
-	Oauth      string     `column:"oauth" json:"oauth"`
-	ModelType  int        `column:"model_type" json:"modelType"` // 1: Codex 2: Anthropic 3: Qwen
-	CreateTime *time.Time `column:"create_time" json:"createTime"`
-	UpdateTime *time.Time `column:"update_time" json:"updateTime"`
+	ID        string     `column:"id" json:"id"`
+	Oauth     string     `column:"oauth" json:"oauth"`
+	ModelType int        `column:"model_type" json:"modelType"` // 1: Codex 2: Anthropic 3: Qwen
+	CreatedAt *time.Time `column:"created_at" json:"createdAt"`
+	UpdatedAt *time.Time `column:"updated_at" json:"updatedAt"`
 }
 
 func (e *CLIOauth) GetTableName() string {
@@ -27,11 +27,11 @@ func (e *CLIOauth) GetPKColumnName() string {
 // CLIUser 对应数据库 cli_user 表
 type CLIUser struct {
 	zorm.EntityStruct
-	ID         string     `column:"id" json:"id"`
-	Status     int        `column:"status" json:"status"` // 1:正常 2:禁用 3:删除
-	UserID     string     `column:"user_id" json:"user_id"`
-	CreateTime *time.Time `column:"create_time" json:"createTime"`
-	UpdateTime *time.Time `column:"update_time" json:"updateTime"`
+	ID        string     `column:"id" json:"id"`
+	Status    int        `column:"status" json:"status"`  // 1:正常 2:禁用 3:删除
+	UserID    string     `column:"user_id" json:"userId"` // 用户ID
+	CreatedAt *time.Time `column:"created_at" json:"createdAt"`
+	UpdatedAt *time.Time `column:"updated_at" json:"updatedAt"`
 }
 
 func (e *CLIUser) GetTableName() string {
