@@ -698,6 +698,35 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "ok"})
 }
 
+// DeleteAuthData 根据 ID 从 cli_oauth 表删除认证记录，并禁用内存中对应的 auth。
+func (h *Handler) DeleteAuthData(c *gin.Context) {
+	// 1. 获取并校验请求参数
+	id := c.Query("name")
+	if id == "" {
+		c.JSON(400, gin.H{"error": "name is required"})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	// 2. 先禁用内存中对应的 auth（此时数据库记录仍存在，persist 只会 UPDATE 而不会重新 INSERT）
+	h.disableAuth(ctx, id)
+
+	// 3. 再从 cli_oauth 表删除记录
+	finder := zorm.NewDeleteFinder((&entity.CLIOauth{}).GetTableName())
+	finder.Append(" where id=?", id)
+
+	_, err := zorm.Transaction(ctx, func(txCtx context.Context) (interface{}, error) {
+		return zorm.UpdateFinder(txCtx, finder)
+	})
+	if err != nil {
+		c.JSON(500, gin.H{"error": fmt.Sprintf("删除数据库记录失败: %v", err)})
+		return
+	}
+
+	c.JSON(200, gin.H{"status": "ok"})
+}
+
 func (h *Handler) findAuthForDelete(name string) *coreauth.Auth {
 	if h == nil || h.authManager == nil {
 		return nil
@@ -1109,6 +1138,23 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	}
 
 	log.Infof("OAuth saved to database: cli_oauth.id=%s, cli_user_id=%s, provider=%s", oauthID, cliUserID, record.Provider)
+
+	// 将新的认证记录注册到内存中的 authManager，使 ListAuthFiles 无需重启即可立即返回新数据。
+	// 需要设置 Attributes["path"]，否则 buildAuthFileEntry 会因 path 为空而过滤掉该记录。
+	if h.authManager != nil {
+		record.ID = oauthID
+		record.FileName = oauthID
+		record.CreatedAt = now
+		record.UpdatedAt = now
+		if record.Attributes == nil {
+			record.Attributes = make(map[string]string)
+		}
+		record.Attributes["path"] = oauthID
+		if _, errReg := h.authManager.Register(ctx, record); errReg != nil {
+			log.Warnf("OAuth saved to DB but failed to register in memory: %v", errReg)
+		}
+	}
+
 	return oauthID, nil
 }
 
