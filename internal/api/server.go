@@ -640,6 +640,12 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/iflow-auth-url", s.mgmt.RequestIFlowCookieToken)
 		mgmt.POST("/oauth-callback", s.mgmt.PostOAuthCallback)
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
+
+		// 用户管理
+		mgmt.GET("/users", s.mgmt.ListUsers)
+		mgmt.POST("/users", s.mgmt.CreateUser)
+		mgmt.PUT("/users", s.mgmt.UpdateUser)
+		mgmt.DELETE("/users", s.mgmt.DeleteUser)
 	}
 }
 
