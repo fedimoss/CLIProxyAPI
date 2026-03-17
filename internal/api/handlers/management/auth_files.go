@@ -519,6 +519,40 @@ func (h *Handler) DownloadAuthFile(c *gin.Context) {
 	c.Data(200, "application/json", data)
 }
 
+// DownloadAuthData 从数据库导出认证记录并以 JSON 文件形式下载。
+// name 参数为认证记录的 ID，直接从 cli_oauth 表查询 oauth 字段返回。
+func (h *Handler) DownloadAuthData(c *gin.Context) {
+	// 1. 获取并校验请求参数
+	id := c.Query("name")
+	if id == "" {
+		c.JSON(400, gin.H{"error": "name is required"})
+		return
+	}
+
+	// 2. 根据 ID 从 cli_oauth 表查询记录
+	ctx := c.Request.Context()
+	finder := zorm.NewSelectFinder((&entity.CLIOauth{}).GetTableName())
+	finder.Append(" where id=?", id)
+
+	cLIOauth := &entity.CLIOauth{}
+	if _, err := zorm.QueryRow(ctx, finder, cLIOauth); err != nil {
+		c.JSON(500, gin.H{"error": fmt.Sprintf("查询数据库失败: %v", err)})
+		return
+	}
+	if cLIOauth.ID == "" {
+		c.JSON(404, gin.H{"error": "auth not found"})
+		return
+	}
+
+	// 3. 取出 oauth 字段内容（即原始 JSON 凭证数据）
+	oauthData := cLIOauth.Oauth
+
+	// 4. 构造下载文件名并返回
+	fileName := id + ".json"
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", fileName))
+	c.Data(200, "application/json", []byte(oauthData))
+}
+
 // Upload auth file: multipart or raw JSON with ?name=
 func (h *Handler) UploadAuthFile(c *gin.Context) {
 	if h.authManager == nil {
@@ -983,118 +1017,16 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	if record == nil {
 		return "", fmt.Errorf("token record is nil")
 	}
+	store := h.tokenStoreWithBaseDir()
+	if store == nil {
+		return "", fmt.Errorf("token store unavailable")
+	}
 	if h.postAuthHook != nil {
 		if err := h.postAuthHook(ctx, record); err != nil {
 			return "", fmt.Errorf("post-auth hook failed: %w", err)
 		}
 	}
-
-	// Serialize OAuth token to JSON (same content as the original JSON file)
-	var oauthJSON []byte
-	var err error
-	switch {
-	case record.Storage != nil:
-		type metadataGetter interface {
-			SetMetadata(map[string]any)
-		}
-		if setter, ok := record.Storage.(metadataGetter); ok && record.Metadata != nil {
-			setter.SetMetadata(record.Metadata)
-		}
-		merged, errMerge := misc.MergeMetadata(record.Storage, record.Metadata)
-		if errMerge != nil {
-			return "", fmt.Errorf("merge metadata failed: %w", errMerge)
-		}
-		// Ensure the "type" field is set, mirroring what each SaveTokenToFile() does.
-		// The struct's Type field may be zero-valued (""), so override it with the provider name.
-		if record.Provider != "" {
-			merged["type"] = record.Provider
-		}
-		oauthJSON, err = json.Marshal(merged)
-		if err != nil {
-			return "", fmt.Errorf("marshal oauth token failed: %w", err)
-		}
-	case record.Metadata != nil:
-		// Mirror filestore.Save: inject "disabled" into metadata before marshalling.
-		record.Metadata["disabled"] = record.Disabled
-		oauthJSON, err = json.Marshal(record.Metadata)
-		if err != nil {
-			return "", fmt.Errorf("marshal oauth metadata failed: %w", err)
-		}
-	default:
-		return "", fmt.Errorf("nothing to persist for %s", record.ID)
-	}
-
-	// Determine model type from provider
-	modelType := providerToModelType(record.Provider)
-
-	// Generate OAuth record ID
-	now := time.Now()
-	oauthID := fmt.Sprintf("oauth_%d", now.UnixNano())
-
-	// Extract cli_user_id from request context, default to "u_10001"
-	cliUserID := "u_10001"
-	if reqInfo := coreauth.GetRequestInfo(ctx); reqInfo != nil {
-		if uid := strings.TrimSpace(reqInfo.Query.Get("cli_user_id")); uid != "" {
-			cliUserID = uid
-		}
-	}
-
-	// Save to cli_oauth and cli_user_oauth in a single transaction
-	_, err = zorm.Transaction(ctx, func(txCtx context.Context) (interface{}, error) {
-		// Insert cli_oauth record
-		oauthRecord := &entity.CLIOauth{
-			ID:        oauthID,
-			Oauth:     string(oauthJSON),
-			ModelType: modelType,
-			CreatedAt: &now,
-			UpdatedAt: &now,
-		}
-		if _, errInsert := zorm.Insert(txCtx, oauthRecord); errInsert != nil {
-			return nil, fmt.Errorf("insert cli_oauth failed: %w", errInsert)
-		}
-
-		// Insert cli_user_oauth record
-		userOauthID := fmt.Sprintf("uo_%d", now.UnixNano())
-		userOauthRecord := &entity.CLIUserOauth{
-			ID:         userOauthID,
-			CliUserId:  cliUserID,
-			CliOauthId: oauthID,
-		}
-		if _, errInsert := zorm.Insert(txCtx, userOauthRecord); errInsert != nil {
-			return nil, fmt.Errorf("insert cli_user_oauth failed: %w", errInsert)
-		}
-
-		return nil, nil
-	})
-	if err != nil {
-		return "", fmt.Errorf("save oauth to database failed: %w", err)
-	}
-
-	log.Infof("OAuth saved to database: cli_oauth.id=%s, cli_user_id=%s, provider=%s", oauthID, cliUserID, record.Provider)
-	return oauthID, nil
-}
-
-// providerToModelType maps provider name to model_type integer.
-// 1: Codex 2: Anthropic 3: Qwen 4: Gemini 5: Antigravity 6: Kimi 7: IFlow
-func providerToModelType(provider string) int {
-	switch strings.ToLower(provider) {
-	case "codex", "openai":
-		return 1
-	case "claude", "anthropic":
-		return 2
-	case "qwen":
-		return 3
-	case "gemini":
-		return 4
-	case "antigravity":
-		return 5
-	case "kimi":
-		return 6
-	case "iflow":
-		return 7
-	default:
-		return 0
-	}
+	return store.Save(ctx, record)
 }
 
 func (h *Handler) RequestAnthropicToken(c *gin.Context) {
@@ -1230,7 +1162,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 			return
 		}
 
-		fmt.Printf("Authentication successful! Token saved to database, oauth_id=%s\n", savedPath)
+		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		if bundle.APIKey != "" {
 			fmt.Println("API key obtained and saved")
 		}
@@ -1488,14 +1420,14 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
-			log.Errorf("Failed to save token to database: %v", errSave)
-			SetOAuthSessionError(state, "Failed to save token to database")
+			log.Errorf("Failed to save token to file: %v", errSave)
+			SetOAuthSessionError(state, "Failed to save token to file")
 			return
 		}
 
 		CompleteOAuthSession(state)
 		CompleteOAuthSessionsByProvider("gemini")
-		fmt.Printf("You can now use Gemini CLI services through this CLI; token saved to database, oauth_id=%s\n", savedPath)
+		fmt.Printf("You can now use Gemini CLI services through this CLI; token saved to %s\n", savedPath)
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
@@ -1635,7 +1567,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 			log.Errorf("Failed to save authentication tokens: %v", errSave)
 			return
 		}
-		fmt.Printf("Authentication successful! Token saved to database, oauth_id=%s\n", savedPath)
+		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		if bundle.APIKey != "" {
 			fmt.Println("API key obtained and saved")
 		}
@@ -1795,14 +1727,14 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
-			log.Errorf("Failed to save token to database: %v", errSave)
-			SetOAuthSessionError(state, "Failed to save token to database")
+			log.Errorf("Failed to save token to file: %v", errSave)
+			SetOAuthSessionError(state, "Failed to save token to file")
 			return
 		}
 
 		CompleteOAuthSession(state)
 		CompleteOAuthSessionsByProvider("antigravity")
-		fmt.Printf("Authentication successful! Token saved to database, oauth_id=%s\n", savedPath)
+		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		if projectID != "" {
 			fmt.Printf("Using GCP project: %s\n", projectID)
 		}
@@ -1860,7 +1792,7 @@ func (h *Handler) RequestQwenToken(c *gin.Context) {
 			return
 		}
 
-		fmt.Printf("Authentication successful! Token saved to database, oauth_id=%s\n", savedPath)
+		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		fmt.Println("You can now use Qwen services through this CLI")
 		CompleteOAuthSession(state)
 	}()
@@ -1936,7 +1868,7 @@ func (h *Handler) RequestKimiToken(c *gin.Context) {
 			return
 		}
 
-		fmt.Printf("Authentication successful! Token saved to database, oauth_id=%s\n", savedPath)
+		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		fmt.Println("You can now use Kimi services through this CLI")
 		CompleteOAuthSession(state)
 		CompleteOAuthSessionsByProvider("kimi")
@@ -2047,7 +1979,7 @@ func (h *Handler) RequestIFlowToken(c *gin.Context) {
 			return
 		}
 
-		fmt.Printf("Authentication successful! Token saved to database, oauth_id=%s\n", savedPath)
+		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		if tokenStorage.APIKey != "" {
 			fmt.Println("API key obtained and saved")
 		}
@@ -2144,13 +2076,13 @@ func (h *Handler) RequestIFlowCookieToken(c *gin.Context) {
 		return
 	}
 
-	fmt.Printf("iFlow cookie authentication successful. Token saved to database, oauth_id=%s\n", savedPath)
+	fmt.Printf("iFlow cookie authentication successful. Token saved to %s\n", savedPath)
 	c.JSON(http.StatusOK, gin.H{
-		"status":   "ok",
-		"oauth_id": savedPath,
-		"email":    email,
-		"expired":  tokenStorage.Expire,
-		"type":     tokenStorage.Type,
+		"status":     "ok",
+		"saved_path": savedPath,
+		"email":      email,
+		"expired":    tokenStorage.Expire,
+		"type":       tokenStorage.Type,
 	})
 }
 
