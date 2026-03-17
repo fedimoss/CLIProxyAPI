@@ -19,7 +19,7 @@ import (
 	"gitee.com/chunanyong/zorm"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
-	configaccess "github.com/router-for-me/CLIProxyAPI/v6/internal/access/config_access"
+	dbaccess "github.com/router-for-me/CLIProxyAPI/v6/internal/access/db_access"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/cmd"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -489,8 +489,9 @@ func main() {
 		}
 	}
 
-	// Register built-in access providers before constructing services.
-	configaccess.Register(&cfg.SDKConfig)
+	// Register DB access provider — only use database for API key validation.
+	// Config file api-keys are no longer used for authentication.
+	dbaccess.Register()
 
 	// Handle different command modes based on the provided flags.
 

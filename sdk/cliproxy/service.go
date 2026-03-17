@@ -500,6 +500,15 @@ func (s *Service) Run(ctx context.Context) error {
 		if errLoad := s.coreManager.Load(ctx); errLoad != nil {
 			log.Warnf("failed to load auth store: %v", errLoad)
 		}
+		// DB store 加载的 auth 不经过 watcher 的 refreshAuthState，需要在此主动注册模型和 executor。
+		for _, auth := range s.coreManager.List() {
+			if auth == nil || auth.ID == "" || auth.Disabled {
+				continue
+			}
+			s.ensureExecutorsForAuth(auth)
+			s.registerModelsForAuth(auth)
+			s.coreManager.RefreshSchedulerEntry(auth.ID)
+		}
 	}
 
 	tokenResult, err := s.tokenProvider.Load(ctx, s.cfg)
