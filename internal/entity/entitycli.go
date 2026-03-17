@@ -42,11 +42,11 @@ func (e *CLIUser) GetPKColumnName() string {
 	return "id"
 }
 
-// cli_user_oauth表
+// CLIUserOauth 对应数据库 cli_user_oauth 表
 type CLIUserOauth struct {
 	zorm.EntityStruct
 	ID         string `column:"id" json:"id"`
-	CliUserId  int    `column:"cli_user_id" json:"cliUserId"` // 1:正常 2:禁用 3:删除
+	CliUserId  string `column:"cli_user_id" json:"cliUserId"`
 	CliOauthId string `column:"cli_oauth_id" json:"cliOauthId"`
 }
 
