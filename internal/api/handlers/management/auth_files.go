@@ -241,6 +241,29 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "handler not initialized"})
 		return
 	}
+
+	// 优先从数据库查询，避免内存缓存导致数据不一致
+	store := h.tokenStoreWithBaseDir()
+	if store != nil {
+		auths, err := store.List(c.Request.Context())
+		if err == nil {
+			files := make([]gin.H, 0, len(auths))
+			for _, auth := range auths {
+				if entry := h.buildAuthFileEntry(auth); entry != nil {
+					files = append(files, entry)
+				}
+			}
+			sort.Slice(files, func(i, j int) bool {
+				nameI, _ := files[i]["name"].(string)
+				nameJ, _ := files[j]["name"].(string)
+				return strings.ToLower(nameI) < strings.ToLower(nameJ)
+			})
+			c.JSON(200, gin.H{"files": files})
+			return
+		}
+		// 数据库查询失败，降级到内存
+	}
+
 	if h.authManager == nil {
 		h.listAuthFilesFromDisk(c)
 		return
@@ -1147,22 +1170,6 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	}
 
 	log.Infof("OAuth saved to database: cli_oauth.id=%s, cli_user_id=%s, provider=%s", oauthID, cliUserID, record.Provider)
-
-	// 将新的认证记录注册到内存中的 authManager，使 ListAuthFiles 无需重启即可立即返回新数据。
-	// 需要设置 Attributes["path"]，否则 buildAuthFileEntry 会因 path 为空而过滤掉该记录。
-	if h.authManager != nil {
-		record.ID = oauthID
-		record.FileName = oauthID
-		record.CreatedAt = now
-		record.UpdatedAt = now
-		if record.Attributes == nil {
-			record.Attributes = make(map[string]string)
-		}
-		record.Attributes["path"] = oauthID
-		if _, errReg := h.authManager.Register(ctx, record); errReg != nil {
-			log.Warnf("OAuth saved to DB but failed to register in memory: %v", errReg)
-		}
-	}
 
 	return oauthID, nil
 }
