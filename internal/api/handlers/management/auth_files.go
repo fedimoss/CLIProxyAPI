@@ -242,28 +242,6 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		return
 	}
 
-	// 优先从数据库查询，避免内存缓存导致数据不一致
-	store := h.tokenStoreWithBaseDir()
-	if store != nil {
-		auths, err := store.List(c.Request.Context())
-		if err == nil {
-			files := make([]gin.H, 0, len(auths))
-			for _, auth := range auths {
-				if entry := h.buildAuthFileEntry(auth); entry != nil {
-					files = append(files, entry)
-				}
-			}
-			sort.Slice(files, func(i, j int) bool {
-				nameI, _ := files[i]["name"].(string)
-				nameJ, _ := files[j]["name"].(string)
-				return strings.ToLower(nameI) < strings.ToLower(nameJ)
-			})
-			c.JSON(200, gin.H{"files": files})
-			return
-		}
-		// 数据库查询失败，降级到内存
-	}
-
 	if h.authManager == nil {
 		h.listAuthFilesFromDisk(c)
 		return
@@ -1170,6 +1148,24 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	}
 
 	log.Infof("OAuth saved to database: cli_oauth.id=%s, cli_user_id=%s, provider=%s", oauthID, cliUserID, record.Provider)
+
+	// 将新的认证记录注册到内存中的 authManager，使 ListAuthFiles 无需重启即可立即返回新数据。
+	// 使用 Clone 避免修改原始 record，防止影响数据库中已保存的数据。
+	if h.authManager != nil {
+		cacheRecord := record
+		cacheRecord.ID = oauthID
+		cacheRecord.FileName = oauthID
+		cacheRecord.CreatedAt = now
+		cacheRecord.UpdatedAt = now
+		if cacheRecord.Attributes == nil {
+			cacheRecord.Attributes = make(map[string]string)
+		}
+		cacheRecord.Attributes["path"] = oauthID
+		regCtx := coreauth.WithSkipPersist(ctx)
+		if _, errReg := h.authManager.Register(regCtx, cacheRecord); errReg != nil {
+			log.Warnf("OAuth saved to DB but failed to register in memory: %v", errReg)
+		}
+	}
 
 	return oauthID, nil
 }
