@@ -6,31 +6,16 @@ import (
 
 	"gitee.com/chunanyong/zorm"
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/entity"
 )
-
-// CLIUser 对应数据库 cli_user 表
-type CLIUser struct {
-	zorm.EntityStruct
-	ID     string `column:"id" json:"id"`
-	Status int    `column:"status" json:"status"` // 1:正常 2:禁用 3:删除
-	UserID string `column:"user_id" json:"user_id"`
-}
-
-func (e *CLIUser) GetTableName() string {
-	return "cli_user"
-}
-
-func (e *CLIUser) GetPKColumnName() string {
-	return "id"
-}
 
 // ListUsers 获取用户列表
 // ListUsers GET /v0/management/users
 func (h *Handler) ListUsers(c *gin.Context) {
-	finder := zorm.NewSelectFinder((&CLIUser{}).GetTableName())
+	finder := zorm.NewSelectFinder((&entity.CLIUser{}).GetTableName())
 	finder.Append("WHERE status != 3 ORDER BY id")
 
-	var users []CLIUser
+	var users []entity.CLIUser
 	err := zorm.Query(context.Background(), finder, &users, nil)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -42,7 +27,7 @@ func (h *Handler) ListUsers(c *gin.Context) {
 // AddUser 添加用户
 // CreateUser POST /v0/management/users
 func (h *Handler) CreateUser(c *gin.Context) {
-	var req CLIUser
+	var req entity.CLIUser
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
@@ -68,7 +53,7 @@ func (h *Handler) CreateUser(c *gin.Context) {
 // UpdateUser 更新用户
 // UpdateUser PUT /v0/management/users
 func (h *Handler) UpdateUser(c *gin.Context) {
-	var req CLIUser
+	var req entity.CLIUser
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
@@ -97,7 +82,7 @@ func (h *Handler) DeleteUser(c *gin.Context) {
 		return
 	}
 
-	finder := zorm.NewUpdateFinder((&CLIUser{}).GetTableName())
+	finder := zorm.NewUpdateFinder((&entity.CLIUser{}).GetTableName())
 	finder.Append("status=3 WHERE id=?", id)
 
 	_, err := zorm.Transaction(context.Background(), func(ctx context.Context) (interface{}, error) {
