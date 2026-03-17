@@ -712,12 +712,21 @@ func (h *Handler) DeleteAuthData(c *gin.Context) {
 	// 2. 先禁用内存中对应的 auth（此时数据库记录仍存在，persist 只会 UPDATE 而不会重新 INSERT）
 	h.disableAuth(ctx, id)
 
-	// 3. 再从 cli_oauth 表删除记录
-	finder := zorm.NewDeleteFinder((&entity.CLIOauth{}).GetTableName())
-	finder.Append(" where id=?", id)
-
+	// 3. 在同一事务中删除 cli_user_oauth 和 cli_oauth 记录
 	_, err := zorm.Transaction(ctx, func(txCtx context.Context) (interface{}, error) {
-		return zorm.UpdateFinder(txCtx, finder)
+		// 先删除 cli_user_oauth 中关联记录
+		userOauthFinder := zorm.NewDeleteFinder((&entity.CLIUserOauth{}).GetTableName())
+		userOauthFinder.Append(" where cli_oauth_id=?", id)
+		if _, errDel := zorm.UpdateFinder(txCtx, userOauthFinder); errDel != nil {
+			return nil, fmt.Errorf("删除 cli_user_oauth 失败: %w", errDel)
+		}
+		// 再删除 cli_oauth 记录
+		oauthFinder := zorm.NewDeleteFinder((&entity.CLIOauth{}).GetTableName())
+		oauthFinder.Append(" where id=?", id)
+		if _, errDel := zorm.UpdateFinder(txCtx, oauthFinder); errDel != nil {
+			return nil, fmt.Errorf("删除 cli_oauth 失败: %w", errDel)
+		}
+		return nil, nil
 	})
 	if err != nil {
 		c.JSON(500, gin.H{"error": fmt.Sprintf("删除数据库记录失败: %v", err)})
