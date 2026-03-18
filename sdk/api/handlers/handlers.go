@@ -348,6 +348,20 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 			}
 		}()
 	}
+	// 从请求 context 中传播 UserOAuthPinMiddleware 设置的业务值。
+	// GetContextWithCancel 基于传入的父 context（通常是 context.Background()）创建新的 context 树，
+	// 因此 c.Request.Context() 上附加的值会丢失，需要在此手动传递。
+	if requestCtx != nil {
+		if pinnedID := pinnedAuthIDFromContext(requestCtx); pinnedID != "" {
+			newCtx = WithPinnedAuthID(newCtx, pinnedID)
+		}
+		if cb := selectedAuthIDCallbackFromContext(requestCtx); cb != nil {
+			newCtx = WithSelectedAuthIDCallback(newCtx, cb)
+		}
+		if sid := executionSessionIDFromContext(requestCtx); sid != "" {
+			newCtx = WithExecutionSessionID(newCtx, sid)
+		}
+	}
 	newCtx = context.WithValue(newCtx, "gin", c)
 	newCtx = context.WithValue(newCtx, "handler", handler)
 	return newCtx, func(params ...interface{}) {
