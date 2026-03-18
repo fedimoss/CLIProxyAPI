@@ -505,9 +505,9 @@ func (s *Service) Run(ctx context.Context) error {
 			if auth == nil || auth.ID == "" || auth.Disabled {
 				continue
 			}
-			s.ensureExecutorsForAuth(auth)
-			s.registerModelsForAuth(auth)
-			s.coreManager.RefreshSchedulerEntry(auth.ID)
+			s.ensureExecutorsForAuth(auth)               // 注册 executor（如 QwenExecutor）
+			s.registerModelsForAuth(auth)                // 注册该 auth 支持的模型列表
+			s.coreManager.RefreshSchedulerEntry(auth.ID) // 刷新 scheduler 条目
 		}
 	}
 
@@ -528,6 +528,17 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	// legacy clients removed; no caches to refresh
+
+	// 注册 post-register 回调，使 OAuth 认证写入数据库后无需重启即可立即使用：
+	// 回调会绑定 executor、注册模型并刷新 scheduler 条目，与启动时 Load 执行的步骤一致。
+	s.serverOptions = append(s.serverOptions, api.WithPostRegisterHook(func(ctx context.Context, auth *coreauth.Auth) {
+		if auth == nil || auth.ID == "" {
+			return
+		}
+		s.ensureExecutorsForAuth(auth)
+		s.registerModelsForAuth(auth)
+		s.coreManager.RefreshSchedulerEntry(auth.ID)
+	}))
 
 	// handlers no longer depend on legacy clients; pass nil slice initially
 	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, s.serverOptions...)

@@ -1150,20 +1150,41 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	log.Infof("OAuth saved to database: cli_oauth.id=%s, cli_user_id=%s, provider=%s", oauthID, cliUserID, record.Provider)
 
 	// 将新的认证记录注册到内存中的 authManager，使 ListAuthFiles 无需重启即可立即返回新数据。
-	// 使用 Clone 避免修改原始 record，防止影响数据库中已保存的数据。
 	if h.authManager != nil {
-		cacheRecord := record
-		cacheRecord.ID = oauthID
-		cacheRecord.FileName = oauthID
-		cacheRecord.CreatedAt = now
-		cacheRecord.UpdatedAt = now
-		if cacheRecord.Attributes == nil {
-			cacheRecord.Attributes = make(map[string]string)
+		// 用与数据库一致的完整 oauthJSON 重建 Metadata，确保缓存中包含完整的 token 信息。
+		// record.Metadata 可能只包含部分字段（如 email），不包含 access_token 等凭证，
+		// 而 oauthJSON 是 Storage + Metadata 合并后的完整序列化结果。
+		fullMetadata := make(map[string]any)
+		if errUnmarshal := json.Unmarshal(oauthJSON, &fullMetadata); errUnmarshal != nil {
+			log.Warnf("OAuth saved to DB but failed to unmarshal for cache: %v", errUnmarshal)
+			return oauthID, nil
 		}
-		cacheRecord.Attributes["path"] = oauthID
+
+		cacheRecord := &coreauth.Auth{
+			ID:        oauthID,
+			Provider:  record.Provider,
+			FileName:  oauthID,
+			Label:     record.Label,
+			Status:    record.Status,
+			Disabled:  record.Disabled,
+			Storage:   record.Storage,
+			Metadata:  fullMetadata,
+			CreatedAt: now,
+			UpdatedAt: now,
+			Attributes: map[string]string{
+				"path": oauthID,
+			},
+		}
+		if email := strings.TrimSpace(valueAsString(fullMetadata["email"])); email != "" {
+			cacheRecord.Attributes["email"] = email
+		}
 		regCtx := coreauth.WithSkipPersist(ctx)
 		if _, errReg := h.authManager.Register(regCtx, cacheRecord); errReg != nil {
 			log.Warnf("OAuth saved to DB but failed to register in memory: %v", errReg)
+		} else if h.postRegisterHook != nil {
+			// 通知 Service 层为新注册的 auth 绑定 executor、注册模型并刷新 scheduler，
+			// 使其立即可用于请求路由，无需重启服务。
+			h.postRegisterHook(regCtx, cacheRecord)
 		}
 	}
 

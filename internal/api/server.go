@@ -52,6 +52,7 @@ type serverOptionConfig struct {
 	keepAliveTimeout     time.Duration
 	keepAliveOnTimeout   func()
 	postAuthHook         auth.PostAuthHook
+	postRegisterHook     func(context.Context, *auth.Auth) // auth 注册到核心管理器后的回调，用于绑定 executor 和模型
 }
 
 // ServerOption customises HTTP server construction.
@@ -114,6 +115,14 @@ func WithRequestLoggerFactory(factory func(*config.Config, string) logging.Reque
 func WithPostAuthHook(hook auth.PostAuthHook) ServerOption {
 	return func(cfg *serverOptionConfig) {
 		cfg.postAuthHook = hook
+	}
+}
+
+// WithPostRegisterHook 注册一个回调，在 auth 注册到核心管理器后调用，
+// 允许 Service 层为新 auth 绑定 executor 和注册模型。
+func WithPostRegisterHook(hook func(context.Context, *auth.Auth)) ServerOption {
+	return func(cfg *serverOptionConfig) {
+		cfg.postRegisterHook = hook
 	}
 }
 
@@ -270,6 +279,10 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s.mgmt.SetLogDirectory(logDir)
 	if optionState.postAuthHook != nil {
 		s.mgmt.SetPostAuthHook(optionState.postAuthHook)
+	}
+	// 设置 auth 注册后的回调，用于绑定 executor 和注册模型
+	if optionState.postRegisterHook != nil {
+		s.mgmt.SetPostRegisterHook(optionState.postRegisterHook)
 	}
 	s.localPassword = optionState.localPassword
 

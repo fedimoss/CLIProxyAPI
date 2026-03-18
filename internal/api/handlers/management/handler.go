@@ -3,6 +3,7 @@
 package management
 
 import (
+	"context"
 	"crypto/subtle"
 	"fmt"
 	"net/http"
@@ -48,6 +49,7 @@ type Handler struct {
 	envSecret           string
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
+	postRegisterHook    func(context.Context, *coreauth.Auth) // auth 注册到核心管理器后的回调，用于绑定 executor 和模型
 }
 
 // NewHandler creates a new management handler instance.
@@ -132,6 +134,12 @@ func (h *Handler) SetLogDirectory(dir string) {
 // SetPostAuthHook registers a hook to be called after auth record creation but before persistence.
 func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 	h.postAuthHook = hook
+}
+
+// SetPostRegisterHook 注册一个回调，在 auth 注册到核心管理器后调用，
+// 使调用方（Service 层）可以为新 auth 绑定 executor 和注册模型。
+func (h *Handler) SetPostRegisterHook(hook func(context.Context, *coreauth.Auth)) {
+	h.postRegisterHook = hook
 }
 
 // Middleware enforces access control for management endpoints.
