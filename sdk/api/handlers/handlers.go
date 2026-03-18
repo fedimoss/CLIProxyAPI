@@ -352,12 +352,15 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	// GetContextWithCancel 基于传入的父 context（通常是 context.Background()）创建新的 context 树，
 	// 因此 c.Request.Context() 上附加的值会丢失，需要在此手动传递。
 	if requestCtx != nil {
+		//  用户 OAuth 凭证绑定
 		if pinnedID := pinnedAuthIDFromContext(requestCtx); pinnedID != "" {
 			newCtx = WithPinnedAuthID(newCtx, pinnedID)
 		}
+		// 选中凭证的回调
 		if cb := selectedAuthIDCallbackFromContext(requestCtx); cb != nil {
 			newCtx = WithSelectedAuthIDCallback(newCtx, cb)
 		}
+		// 执行会话 ID
 		if sid := executionSessionIDFromContext(requestCtx); sid != "" {
 			newCtx = WithExecutionSessionID(newCtx, sid)
 		}
