@@ -406,11 +406,13 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			entry["size"] = info.Size()
 			entry["modtime"] = info.ModTime()
 		} else if os.IsNotExist(err) {
+			// 返回 nil 会导致禁用状态的 oauth 在 oauth 列表中不显示
 			// Hide credentials removed from disk but still lingering in memory.
-			if !runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled || strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "removed via management api")) {
-				return nil
-			}
+			// if !runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled || strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "removed via management api")) {
+			// 	return nil
+			// }
 			entry["source"] = "memory"
+			entry["size"] = int64(0)
 		} else {
 			log.WithError(err).Warnf("failed to stat auth file %s", path)
 		}

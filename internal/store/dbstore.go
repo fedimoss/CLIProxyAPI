@@ -147,7 +147,14 @@ func (s *DBTokenStore) rowToAuth(item entity.CLIOauth) (*cliproxyauth.Auth, erro
 		provider = modelTypeToProvider(item.ModelType)
 	}
 
-	disabled, _ := metadata["disabled"].(bool)
+	// 优先使用数据库的 status 字段（1=正常, 2=禁用），其次才检查 metadata 中的 disabled
+	disabled := false
+	if item.Status == 2 {
+		disabled = true
+	} else if d, ok := metadata["disabled"].(bool); ok {
+		disabled = d
+	}
+
 	status := cliproxyauth.StatusActive
 	if disabled {
 		status = cliproxyauth.StatusDisabled
