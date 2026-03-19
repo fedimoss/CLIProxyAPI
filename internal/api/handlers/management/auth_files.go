@@ -1160,6 +1160,7 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 			ID:        oauthID,
 			Oauth:     string(oauthJSON),
 			ModelType: modelType,
+			Status:    1, // 默认启用状态
 			CreatedAt: &now,
 			UpdatedAt: &now,
 		}
