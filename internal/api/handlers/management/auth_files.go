@@ -401,20 +401,20 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	}
 	if path != "" {
 		entry["path"] = path
-		entry["source"] = "file"
-		if info, err := os.Stat(path); err == nil {
-			entry["size"] = info.Size()
-			entry["modtime"] = info.ModTime()
-		} else if os.IsNotExist(err) {
-			// 返回 nil 会导致禁用状态的 oauth 在 oauth 列表中不显示
-			// Hide credentials removed from disk but still lingering in memory.
-			// if !runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled || strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "removed via management api")) {
-			// 	return nil
-			// }
-			entry["source"] = "memory"
-			entry["size"] = int64(0)
-		} else {
-			log.WithError(err).Warnf("failed to stat auth file %s", path)
+		entry["source"] = "memory"
+		entry["size"] = int64(0)
+
+		// 检查数据库记录是否存在（全部使用数据库模式）
+		ctx := context.Background()
+		finder := zorm.NewSelectFinder((&entity.CLIOauth{}).GetTableName())
+		finder.Append(" where id=?", path)
+		tempRecord := &entity.CLIOauth{}
+		_, errQuery := zorm.QueryRow(ctx, finder, tempRecord)
+		recordExists := (errQuery == nil && tempRecord.ID != "")
+
+		// 统一的过滤逻辑：数据库记录不存在 + Disabled → 不显示（已删除）
+		if !recordExists && (auth.Disabled || auth.Status == coreauth.StatusDisabled) {
+			return nil
 		}
 	}
 	if claims := extractCodexIDTokenClaims(auth); claims != nil {
@@ -914,6 +914,18 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		return
 	}
 
+	// 处理模型注册/注销和调度器刷新
+	if *req.Disabled {
+		// 禁用时注销模型注册
+		registry.GetGlobalRegistry().UnregisterClient(targetAuth.ID)
+	} else {
+		// 启用时触发 postRegisterHook 来注册模型并刷新调度器
+		// 这样可以复用 Service 层的逻辑，保持一致性
+		if h.postRegisterHook != nil {
+			h.postRegisterHook(ctx, targetAuth)
+		}
+	}
+
 	// 更新数据库数据
 	finder := zorm.NewUpdateFinder((&entity.CLIOauth{}).GetTableName())
 	status := 1
@@ -1197,7 +1209,8 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 			CreatedAt: now,
 			UpdatedAt: now,
 			Attributes: map[string]string{
-				"path": oauthID,
+				"path":         oauthID,
+				"runtime_only": "true",
 			},
 		}
 		if email := strings.TrimSpace(valueAsString(fullMetadata["email"])); email != "" {
