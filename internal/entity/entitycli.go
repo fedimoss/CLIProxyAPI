@@ -14,6 +14,7 @@ type CLIOauth struct {
 	ModelType int        `column:"model_type" json:"modelType"` // 1: Codex 2: Anthropic 3: Qwen
 	CreatedAt *time.Time `column:"created_at" json:"createdAt"`
 	UpdatedAt *time.Time `column:"updated_at" json:"updatedAt"`
+	Status    int        `column:"status" json:"status"` // 1:正常 2:禁用
 }
 
 func (e *CLIOauth) GetTableName() string {

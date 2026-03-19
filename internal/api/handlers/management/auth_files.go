@@ -895,6 +895,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		return
 	}
 
+	// 更新缓存数据
 	// Update disabled state
 	targetAuth.Disabled = *req.Disabled
 	if *req.Disabled {
@@ -907,6 +908,28 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	targetAuth.UpdatedAt = time.Now()
 
 	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
+		return
+	}
+
+	// 更新数据库数据
+	finder := zorm.NewUpdateFinder((&entity.CLIOauth{}).GetTableName())
+	status := 1
+	if targetAuth.Disabled {
+		status = 2
+	}
+
+	finder.Append("status=?, updated_at=? where id=?", status, time.Now(), name)
+
+	// 执行事务更新
+	_, err := zorm.Transaction(ctx, func(txCtx context.Context) (interface{}, error) {
+		_, errUpdate := zorm.UpdateFinder(txCtx, finder)
+		if errUpdate != nil {
+			return nil, errUpdate
+		}
+		return nil, nil
+	})
+	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
 		return
 	}
