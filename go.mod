@@ -1,6 +1,6 @@
 module github.com/router-for-me/CLIProxyAPI/v6
 
-go 1.26.0
+go 1.26
 
 require (
 	gitee.com/chunanyong/zorm v1.8.3
