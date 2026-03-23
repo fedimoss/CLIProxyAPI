@@ -78,6 +78,24 @@ func (s *DBTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (strin
 		return "", fmt.Errorf("dbstore: 查询已有记录失败: %w", err)
 	}
 
+	// IMPORTANT:
+	// cli_oauth.status 在数据库里约定：1=正常, 2=禁用（允许 NULL）。
+	// entity.CLIOauth.Status 是 int，零值=0；如果不显式赋值，zorm Insert/Update 可能会把 0 写入数据库
+	// （尤其是 Update 会覆盖原有 status）。
+	//
+	// 规则：
+	// - 如果 auth 显式为禁用（Disabled 或 StatusDisabled），写 2
+	// - 否则更新时保留数据库已有状态（避免刷新 token 时意外“启用/禁用”）
+	// - 插入时默认写 1（避免出现 0）
+	status := 1
+	if existing != nil && existing.Status != 0 {
+		status = existing.Status
+	}
+	if auth.Disabled || auth.Status == cliproxyauth.StatusDisabled {
+		status = 2
+	}
+	record.Status = status
+
 	_, err = zorm.Transaction(ctx, func(txCtx context.Context) (interface{}, error) {
 		if existing != nil {
 			record.CreatedAt = existing.CreatedAt
