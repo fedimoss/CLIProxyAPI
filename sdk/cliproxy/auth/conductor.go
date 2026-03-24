@@ -2274,6 +2274,11 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 		selected, providerKey, errPick = m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)
 	}
 	if errPick != nil {
+		if log.IsLevelEnabled(log.DebugLevel) {
+			entry := logEntryWithRequestID(ctx)
+			pinned := pinnedAuthIDFromMetadata(opts.Metadata)
+			entry.Debugf("scheduler pick failed (providers=%v model=%s pinned_auth_id=%s tried=%d): %v", eligibleProviders, model, pinned, len(tried), errPick)
+		}
 		return nil, nil, "", errPick
 	}
 	if selected == nil {
