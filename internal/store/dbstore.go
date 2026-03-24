@@ -96,57 +96,13 @@ func (s *DBTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (strin
 	}
 	record.Status = status
 
-	cliUserID := ""
-	attachToUser := false
-	if reqInfo := cliproxyauth.GetRequestInfo(ctx); reqInfo != nil {
-		attachToUser = true
-		if uid := strings.TrimSpace(reqInfo.Query.Get("cli_user_id")); uid != "" {
-			cliUserID = uid
-		}
-		// Keep backwards-compatible behaviour with management/auth_files.go saveTokenRecord():
-		// when request info is present but cli_user_id is omitted, default to "u_10001".
-		if cliUserID == "" {
-			cliUserID = "u_10001"
-		}
-	}
-
 	_, err = zorm.Transaction(ctx, func(txCtx context.Context) (interface{}, error) {
 		if existing != nil {
 			record.CreatedAt = existing.CreatedAt
-			if _, errUpdate := zorm.Update(txCtx, &record); errUpdate != nil {
-				return nil, errUpdate
-			}
-		} else {
-			record.CreatedAt = &now
-			if _, errInsert := zorm.Insert(txCtx, &record); errInsert != nil {
-				return nil, errInsert
-			}
+			return zorm.Update(txCtx, &record)
 		}
-
-		if attachToUser && strings.TrimSpace(cliUserID) != "" {
-			// Ensure (cli_user_id, cli_oauth_id) mapping exists so DB access provider can validate the API key.
-			countFinder := zorm.NewSelectFinder((&entity.CLIUserOauth{}).GetTableName(), "count(*)")
-			countFinder.Append(" where cli_user_id=? and cli_oauth_id=?", cliUserID, record.ID)
-
-			var count int
-			has, errCount := zorm.QueryRow(txCtx, countFinder, &count)
-			if errCount != nil {
-				return nil, fmt.Errorf("dbstore: 鏌ヨ cli_user_oauth 澶辫触: %w", errCount)
-			}
-			if !has || count == 0 {
-				userOauthID := fmt.Sprintf("uo_%d", time.Now().UnixNano())
-				userOauthRecord := &entity.CLIUserOauth{
-					ID:         userOauthID,
-					CliUserId:  cliUserID,
-					CliOauthId: record.ID,
-				}
-				if _, errInsert := zorm.Insert(txCtx, userOauthRecord); errInsert != nil {
-					return nil, fmt.Errorf("dbstore: 鎻掑叆 cli_user_oauth 澶辫触: %w", errInsert)
-				}
-			}
-		}
-
-		return nil, nil
+		record.CreatedAt = &now
+		return zorm.Insert(txCtx, &record)
 	})
 	if err != nil {
 		return "", fmt.Errorf("dbstore: 保存 auth 失败: %w", err)
