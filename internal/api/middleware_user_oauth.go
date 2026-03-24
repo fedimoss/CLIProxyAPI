@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"math/rand"
+	"strings"
 
 	"gitee.com/chunanyong/zorm"
 	"github.com/gin-gonic/gin"
@@ -35,8 +36,23 @@ func UserOAuthPinMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		// 随机选一个 cli_oauth_id
-		selected := userOauths[rand.Intn(len(userOauths))]
+		// 随机选一个 cli_oauth_id，过滤掉文件名格式的旧数据
+		var validOauths []entity.CLIUserOauth
+		for _, uo := range userOauths {
+			// 跳过文件名格式的旧数据（包含 .json 或 /）
+			if strings.Contains(uo.CliOauthId, ".json") || strings.Contains(uo.CliOauthId, "/") || strings.Contains(uo.CliOauthId, "\\") {
+				continue
+			}
+			validOauths = append(validOauths, uo)
+		}
+
+		if len(validOauths) == 0 {
+			// 没有有效的 oauth ID，不设置 pinned auth
+			c.Next()
+			return
+		}
+
+		selected := validOauths[rand.Intn(len(validOauths))]
 
 		// 注入 pinned auth ID 到 request context
 		ctx := handlers.WithPinnedAuthID(c.Request.Context(), selected.CliOauthId)
