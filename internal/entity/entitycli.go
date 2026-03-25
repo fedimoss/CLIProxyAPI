@@ -15,6 +15,8 @@ type CLIOauth struct {
 	CreatedAt *time.Time `column:"created_at" json:"createdAt"`
 	UpdatedAt *time.Time `column:"updated_at" json:"updatedAt"`
 	Status    int        `column:"status" json:"status"` // 1:正常 2:禁用
+	// AccountID：仅在 model_type=1（Codex）时使用，用于从 OAuth JSON 里提取并落库，便于做“同用户去重/更新”。
+	AccountID string `column:"account_id" json:"accountId"`
 }
 
 func (e *CLIOauth) GetTableName() string {

@@ -1463,7 +1463,7 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	// Determine model type from provider
 	modelType := providerToModelType(record.Provider)
 
-	// Generate OAuth record ID
+	// 生成 OAuth 记录 ID（默认走“新增”路径；如果后面命中“同用户去重更新”，会改用已存在的记录 ID）
 	now := time.Now()
 	oauthID := fmt.Sprintf("oauth_%d", now.UnixNano())
 
@@ -1482,6 +1482,126 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 		}
 	}
 
+	// 仅对 model_type=1（Codex）做“同用户 account_id 去重 + 更新”：
+	// - 同一个用户重复上传/重复 OAuth 认证同一账号（account_id 相同）时，不再新增多条记录，而是更新原记录内容。
+	// - 不同用户即使拿到同一个文件（account_id 相同），也会各自拥有一条独立记录（因为关联表不同）。
+	accountID := ""
+	if modelType == 1 {
+		// 约定：当 model_type=1 时，JSON 内容里必定存在 account_id
+		accountID = strings.TrimSpace(gjson.GetBytes(oauthJSON, "account_id").String())
+		if accountID == "" {
+			// 兼容部分 JSON 使用驼峰命名的情况（防御性兜底）
+			accountID = strings.TrimSpace(gjson.GetBytes(oauthJSON, "accountId").String())
+		}
+		if accountID == "" {
+			return "", fmt.Errorf("model_type=1 缺少 account_id，无法落库")
+		}
+
+		// 查找：当前用户是否已经有同一个 account_id 的记录
+		type existingOauthRow struct {
+			ID        string     `column:"id"`
+			Status    int        `column:"status"`
+			CreatedAt *time.Time `column:"created_at"`
+		}
+		finder := zorm.NewSelectFinder("cli_oauth o join cli_user_oauth uo on o.id = uo.cli_oauth_id", "o.id, o.status, o.created_at")
+		finder.Append("where o.model_type=? and o.account_id=? and uo.cli_user_id=?", modelType, accountID, cliUserID)
+		finder.Append("limit 1")
+
+		var rows []*existingOauthRow
+		if errQuery := zorm.Query(ctx, finder, &rows, nil); errQuery != nil {
+			return "", fmt.Errorf("查询 account_id 是否已存在失败: %w", errQuery)
+		}
+		if len(rows) > 0 && rows[0] != nil && strings.TrimSpace(rows[0].ID) != "" {
+			existingID := strings.TrimSpace(rows[0].ID)
+
+			// 已存在：更新该用户名下的这条记录（不新增）
+			_, errUpdate := zorm.Transaction(ctx, func(txCtx context.Context) (interface{}, error) {
+				updateFinder := zorm.NewUpdateFinder((&entity.CLIOauth{}).GetTableName())
+				// 只更新 oauth 内容与更新时间；status（启用/禁用）保持不变，避免覆盖用户手动操作。
+				updateFinder.Append("oauth=?, updated_at=?, account_id=? where id=?", string(oauthJSON), now, accountID, existingID)
+				if _, errExec := zorm.UpdateFinder(txCtx, updateFinder); errExec != nil {
+					return nil, fmt.Errorf("update cli_oauth failed: %w", errExec)
+				}
+				return nil, nil
+			})
+			if errUpdate != nil {
+				return "", fmt.Errorf("更新数据库记录失败: %w", errUpdate)
+			}
+
+			log.Infof("OAuth updated in database: cli_oauth.id=%s, cli_user_id=%s, provider=%s, account_id=%s", existingID, cliUserID, record.Provider, accountID)
+
+			// 同步更新内存缓存（authManager）并触发 Service 刷新 executor/模型/scheduler
+			if h.authManager != nil {
+				fullMetadata := make(map[string]any)
+				if errUnmarshal := json.Unmarshal(oauthJSON, &fullMetadata); errUnmarshal != nil {
+					log.Warnf("OAuth updated in DB but failed to unmarshal for cache: %v", errUnmarshal)
+					return existingID, nil
+				}
+
+				regCtx := coreauth.WithSkipPersist(ctx)
+				if cached, ok := h.authManager.GetByID(existingID); ok && cached != nil {
+					// 保留 disabled/status 等用户操作，只更新凭据内容。
+					cached.Provider = record.Provider
+					cached.Label = record.Label
+					cached.Storage = record.Storage
+					cached.Metadata = fullMetadata
+					cached.UpdatedAt = now
+					if cached.Attributes == nil {
+						cached.Attributes = make(map[string]string)
+					}
+					cached.Attributes["path"] = existingID
+					if email := strings.TrimSpace(valueAsString(fullMetadata["email"])); email != "" {
+						cached.Attributes["email"] = email
+					}
+
+					if _, errUpdateMem := h.authManager.Update(regCtx, cached); errUpdateMem != nil {
+						log.Warnf("OAuth updated in DB but failed to update in memory: %v", errUpdateMem)
+					} else if h.postRegisterHook != nil {
+						h.postRegisterHook(regCtx, cached)
+					}
+				} else {
+					// 内存里没有这条记录：补注册一份，确保无需重启即可生效。
+					disabled := record.Disabled
+					status := record.Status
+					if rows[0].Status == 2 {
+						disabled = true
+						status = coreauth.StatusDisabled
+					}
+					createdAt := now
+					if rows[0].CreatedAt != nil && !rows[0].CreatedAt.IsZero() {
+						createdAt = *rows[0].CreatedAt
+					}
+
+					cacheRecord := &coreauth.Auth{
+						ID:        existingID,
+						Provider:  record.Provider,
+						FileName:  existingID,
+						Label:     record.Label,
+						Status:    status,
+						Disabled:  disabled,
+						Storage:   record.Storage,
+						Metadata:  fullMetadata,
+						CreatedAt: createdAt,
+						UpdatedAt: now,
+						Attributes: map[string]string{
+							"path": existingID,
+						},
+					}
+					if email := strings.TrimSpace(valueAsString(fullMetadata["email"])); email != "" {
+						cacheRecord.Attributes["email"] = email
+					}
+					if _, errReg := h.authManager.Register(regCtx, cacheRecord); errReg != nil {
+						log.Warnf("OAuth updated in DB but failed to register in memory: %v", errReg)
+					} else if h.postRegisterHook != nil {
+						h.postRegisterHook(regCtx, cacheRecord)
+					}
+				}
+			}
+
+			return existingID, nil
+		}
+	}
+
 	// Save to cli_oauth and cli_user_oauth in a single transaction
 	_, err = zorm.Transaction(ctx, func(txCtx context.Context) (interface{}, error) {
 		// Insert cli_oauth record
@@ -1489,6 +1609,7 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 			ID:        oauthID,
 			Oauth:     string(oauthJSON),
 			ModelType: modelType,
+			AccountID: accountID,
 			Status:    1, // 默认启用状态
 			CreatedAt: &now,
 			UpdatedAt: &now,
