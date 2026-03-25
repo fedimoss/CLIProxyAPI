@@ -21,6 +21,8 @@ import (
 const (
 	DefaultPanelGitHubRepository = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
 	DefaultPprofAddr             = "127.0.0.1:8316"
+	// DefaultCLIUserID 用于在未显式传 cli_user_id 时，给数据库模式下的 OAuth 记录做默认关联。
+	DefaultCLIUserID = "u_10001"
 )
 
 // Config represents the application's configuration, loaded from a YAML file.
@@ -40,6 +42,10 @@ type Config struct {
 
 	// AuthDir is the directory where authentication token files are stored.
 	AuthDir string `yaml:"auth-dir" json:"-"`
+
+	// CLIUserID 用于数据库模式下“导入/上传 OAuth 记录”时，作为默认的 cli_user_id。
+	// 如果请求里传了 cli_user_id，则以请求为准。
+	CLIUserID string `yaml:"cli-user-id" json:"cli-user-id"`
 
 	// Debug enables or disables debug-level logging and other debug features.
 	Debug bool `yaml:"debug" json:"debug"`
@@ -568,6 +574,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.ErrorLogsMaxFiles = 10
 	cfg.UsageStatisticsEnabled = false
 	cfg.DisableCooling = false
+	cfg.CLIUserID = DefaultCLIUserID
 	cfg.Pprof.Enable = false
 	cfg.Pprof.Addr = DefaultPprofAddr
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
@@ -618,6 +625,11 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.Pprof.Addr = strings.TrimSpace(cfg.Pprof.Addr)
 	if cfg.Pprof.Addr == "" {
 		cfg.Pprof.Addr = DefaultPprofAddr
+	}
+
+	cfg.CLIUserID = strings.TrimSpace(cfg.CLIUserID)
+	if cfg.CLIUserID == "" {
+		cfg.CLIUserID = DefaultCLIUserID
 	}
 
 	if cfg.LogsMaxTotalSizeMB < 0 {

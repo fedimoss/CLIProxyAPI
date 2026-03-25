@@ -367,3 +367,9 @@ database:
   max-idle-conns: 50                   # 最大空闲连接数
   conn-max-lifetime-second: 600        # 连接最大存活时间(秒)
   slow-sql-millis: 0                   # 慢SQL阈值(毫秒)，<0禁用，=0仅输出SQL，>0计算执行时间
+
+
+
+# 在将OAuth记录导入/上传到数据库模式时使用的默认cli_user_id。
+# 如果请求中传递了cli_user_id，则以该值为准。
+cli-user-id: "u_10001"

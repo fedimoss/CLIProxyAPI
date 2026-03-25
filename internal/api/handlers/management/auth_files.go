@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -29,6 +30,7 @@ import (
 	iflowauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/iflow"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/qwen"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/entity"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
@@ -363,12 +365,9 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		return nil
 	}
 	auth.EnsureIndex()
-	runtimeOnly := isRuntimeOnlyAuth(auth)
-	if runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled) {
-		return nil
-	}
+	runtimeOnlyDetected := isRuntimeOnlyAuth(auth)
 	path := strings.TrimSpace(authAttribute(auth, "path"))
-	if path == "" && !runtimeOnly {
+	if path == "" && !runtimeOnlyDetected {
 		return nil
 	}
 	name := strings.TrimSpace(auth.FileName)
@@ -386,9 +385,11 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		"status_message": auth.StatusMessage,
 		"disabled":       auth.Disabled,
 		"unavailable":    auth.Unavailable,
-		"runtime_only":   runtimeOnly,
-		"source":         "memory",
-		"size":           int64(0),
+		// 管理页面是否显示“删除/查看”等按钮，会参考 runtime_only。
+		// 这里统一不返回 true：只要记录在列表里出现，就应该允许管理操作。
+		"runtime_only": false,
+		"source":       "memory",
+		"size":         int64(0),
 	}
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
@@ -668,6 +669,158 @@ func (h *Handler) UploadAuthFile(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "ok"})
 }
 
+type fileAuthSkipper interface {
+	SkipFileAuth() bool
+}
+
+// shouldImportAuthUploadToDB 用来判断“上传 auth 文件”这件事到底应该怎么落地：
+//
+//   - 如果当前 token store 明确表示“不走文件系统”（SkipFileAuth=true），说明服务端在运行时主要依赖数据库来保存/读取凭据；
+//     这时上传就不应该只写到 auth-dir，否则用户会看到“上传成功但实际用不上/关联不上”的情况。
+//   - 其他情况沿用原逻辑：落盘到 auth-dir，然后注册到内存管理器。
+func (h *Handler) shouldImportAuthUploadToDB() bool {
+	if h == nil {
+		return false
+	}
+	store := h.tokenStoreWithBaseDir()
+	if store == nil {
+		return false
+	}
+	if skipper, ok := store.(fileAuthSkipper); ok && skipper.SkipFileAuth() {
+		return true
+	}
+	return false
+}
+
+// UploadAuthFileV2 在原 UploadAuthFile 的基础上，增加“写入数据库并关联 cli_user_oauth”的行为。
+//
+// 规则：
+//   - 如果当前使用的是“非文件型”的 token store（例如 DBTokenStore），就把上传内容当成一条 OAuth 记录写入数据库，
+//     并在 cli_user_oauth 里插入一条关联记录；cli_user_id 来自 query，缺省取 config.yaml 的 cli-user-id。
+//   - 其他情况下保持原行为：落盘到 auth-dir 并注册到内存管理器。
+func (h *Handler) UploadAuthFileV2(c *gin.Context) {
+	if h == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
+		return
+	}
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	// 如果当前不是“数据库优先”的运行方式，直接走原来的上传逻辑即可（保持行为一致）。
+	if !h.shouldImportAuthUploadToDB() {
+		h.UploadAuthFile(c)
+		return
+	}
+
+	// 把 query/header 放进 context：saveTokenRecord 会从这里读取 cli_user_id（没传时用 config.yaml 的 cli-user-id）。
+	ctx = PopulateAuthContext(ctx, c)
+
+	// 1) multipart 上传（浏览器表单/文件选择器常用）
+	if file, err := c.FormFile("file"); err == nil && file != nil {
+		name := filepath.Base(file.Filename)
+		if !strings.HasSuffix(strings.ToLower(name), ".json") {
+			c.JSON(400, gin.H{"error": "file must be .json"})
+			return
+		}
+		f, errOpen := file.Open()
+		if errOpen != nil {
+			c.JSON(400, gin.H{"error": "failed to open uploaded file"})
+			return
+		}
+		defer func() { _ = f.Close() }()
+
+		data, errRead := io.ReadAll(f)
+		if errRead != nil {
+			c.JSON(400, gin.H{"error": "failed to read uploaded file"})
+			return
+		}
+		record, errBuild := buildAuthRecordFromJSON(data)
+		if errBuild != nil {
+			c.JSON(400, gin.H{"error": errBuild.Error()})
+			return
+		}
+		oauthID, errSave := h.saveTokenRecord(ctx, record)
+		if errSave != nil {
+			c.JSON(500, gin.H{"error": errSave.Error()})
+			return
+		}
+		c.JSON(200, gin.H{"status": "ok", "id": oauthID})
+		return
+	}
+
+	// 2) raw JSON：POST ?name=xxx.json + body（某些客户端不方便发 multipart，会走这个分支）
+	//
+	// 注意：这里的 name 主要用于兼容旧客户端的参数校验；实际写入数据库时不会用它作为记录 ID，
+	// 记录 ID 会在 saveTokenRecord 里统一生成。
+	name := c.Query("name")
+	if name == "" || strings.Contains(name, string(os.PathSeparator)) {
+		c.JSON(400, gin.H{"error": "invalid name"})
+		return
+	}
+	if !strings.HasSuffix(strings.ToLower(name), ".json") {
+		c.JSON(400, gin.H{"error": "name must end with .json"})
+		return
+	}
+	data, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(400, gin.H{"error": "failed to read body"})
+		return
+	}
+	record, errBuild := buildAuthRecordFromJSON(data)
+	if errBuild != nil {
+		c.JSON(400, gin.H{"error": errBuild.Error()})
+		return
+	}
+	oauthID, errSave := h.saveTokenRecord(ctx, record)
+	if errSave != nil {
+		c.JSON(500, gin.H{"error": errSave.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"status": "ok", "id": oauthID})
+}
+
+// buildAuthRecordFromJSON 把上传的 JSON 内容转换成内存里的认证记录结构。
+//
+// 说明：
+// - 这份 JSON 本质上就是“凭据内容”，会原样写入数据库（cli_oauth.oauth）。
+// - type/email/disabled 这些字段是系统常用字段：type 用来识别提供商，email 用来展示，disabled 用来控制是否停用。
+func buildAuthRecordFromJSON(data []byte) (*coreauth.Auth, error) {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return nil, fmt.Errorf("empty auth json")
+	}
+	metadata := make(map[string]any)
+	if err := json.Unmarshal(trimmed, &metadata); err != nil {
+		return nil, fmt.Errorf("invalid auth json: %w", err)
+	}
+	provider := strings.TrimSpace(valueAsString(metadata["type"]))
+	if provider == "" {
+		provider = "unknown"
+		metadata["type"] = provider
+	}
+	label := provider
+	if email := strings.TrimSpace(valueAsString(metadata["email"])); email != "" {
+		label = email
+	}
+	disabled := false
+	if v, ok := metadata["disabled"].(bool); ok {
+		disabled = v
+	}
+	return &coreauth.Auth{
+		Provider:  provider,
+		Label:     label,
+		Disabled:  disabled,
+		Status:    coreauth.StatusActive,
+		Metadata:  metadata,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}, nil
+}
+
 // Delete auth files: single by name or all
 func (h *Handler) DeleteAuthFile(c *gin.Context) {
 	if h.authManager == nil {
@@ -747,42 +900,146 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "ok"})
 }
 
-// DeleteAuthData 根据 ID 从 cli_oauth 表删除认证记录，并禁用内存中对应的 auth。
+// DeleteAuthData 删除数据库里的认证记录，并把内存里的对应项一并停用。
+//
+// 约定：
+// - 传 `all=true/1/*`：删除全部
+// - 否则必须传 `name`（记录 ID）：删除单条
+// - `all` 优先从 query 取；如果没传，再尝试从 body 里取（支持 `all=true` 或 JSON）
 func (h *Handler) DeleteAuthData(c *gin.Context) {
-	// 1. 获取并校验请求参数
-	id := c.Query("name")
-	if id == "" {
+	ctx := c.Request.Context()
+
+	// 1) 判断是否“全删”
+	allRaw := strings.TrimSpace(c.Query("all"))
+	if allRaw == "" {
+		allRaw = readAllParamFromBody(c)
+	}
+	if isTruthyFlag(allRaw) {
+		// 先把内存里的认证项都停用掉，并且从“可用模型清单”里移除。
+		// 这样删除后不用重启，/v1/models 会立刻按剩余账号变化（比如删光就变 0）。
+		reg := registry.GetGlobalRegistry()
+		if h != nil && h.authManager != nil {
+			for _, auth := range h.authManager.List() {
+				if isRuntimeOnlyAuth(auth) {
+					continue
+				}
+				if auth != nil && strings.TrimSpace(auth.ID) != "" {
+					reg.UnregisterClient(auth.ID)
+				}
+				h.disableAuth(ctx, auth.ID)
+			}
+		}
+
+		if err := deleteOauthRecords(ctx, ""); err != nil {
+			c.JSON(500, gin.H{"error": fmt.Sprintf("删除数据库记录失败: %v", err)})
+			return
+		}
+		c.JSON(200, gin.H{"status": "ok"})
+		return
+	}
+
+	// 2) 单条删除：要求 name 必填（通常就是记录 ID）
+	name := strings.TrimSpace(c.Query("name"))
+	if name == "" {
 		c.JSON(400, gin.H{"error": "name is required"})
 		return
 	}
 
-	ctx := c.Request.Context()
+	// 尽量把 name 解析成真正的 auth.ID（避免传文件名/别名时“删了库，但内存没删到”）
+	authID := name
+	if target := h.findAuthForDelete(name); target != nil && strings.TrimSpace(target.ID) != "" {
+		authID = strings.TrimSpace(target.ID)
+	}
 
-	// 2. 先禁用内存中对应的 auth（此时数据库记录仍存在，persist 只会 UPDATE 而不会重新 INSERT）
-	h.disableAuth(ctx, id)
+	// 删除前先从“可用模型清单”移除，并停用内存项：
+	// 就算数据库删除失败，也不要继续让它在运行中可用。
+	registry.GetGlobalRegistry().UnregisterClient(authID)
+	h.disableAuth(ctx, authID)
 
-	// 3. 在同一事务中删除 cli_user_oauth 和 cli_oauth 记录
-	_, err := zorm.Transaction(ctx, func(txCtx context.Context) (interface{}, error) {
-		// 先删除 cli_user_oauth 中关联记录
-		userOauthFinder := zorm.NewDeleteFinder((&entity.CLIUserOauth{}).GetTableName())
-		userOauthFinder.Append(" where cli_oauth_id=?", id)
-		if _, errDel := zorm.UpdateFinder(txCtx, userOauthFinder); errDel != nil {
-			return nil, fmt.Errorf("删除 cli_user_oauth 失败: %w", errDel)
-		}
-		// 再删除 cli_oauth 记录
-		oauthFinder := zorm.NewDeleteFinder((&entity.CLIOauth{}).GetTableName())
-		oauthFinder.Append(" where id=?", id)
-		if _, errDel := zorm.UpdateFinder(txCtx, oauthFinder); errDel != nil {
-			return nil, fmt.Errorf("删除 cli_oauth 失败: %w", errDel)
-		}
-		return nil, nil
-	})
-	if err != nil {
+	if err := deleteOauthRecords(ctx, authID); err != nil {
 		c.JSON(500, gin.H{"error": fmt.Sprintf("删除数据库记录失败: %v", err)})
 		return
 	}
 
 	c.JSON(200, gin.H{"status": "ok"})
+}
+
+func isTruthyFlag(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "*":
+		return true
+	default:
+		return false
+	}
+}
+
+// readAllParamFromBody 从 body 里解析 `all`（支持 `all=true` 或 JSON: {"all":true}）。
+// 读取后会把 body 放回去，避免影响后续读取（防御性处理）。
+func readAllParamFromBody(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	raw, errRead := c.GetRawData()
+	if errRead != nil {
+		return ""
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return ""
+	}
+	c.Request.Body = io.NopCloser(bytes.NewBuffer(raw))
+
+	// JSON 形式：{"all":true} / {"all":"true"} / {"all":1}
+	if trimmed[0] == '{' {
+		var payload struct {
+			All any `json:"all"`
+		}
+		if errJSON := json.Unmarshal(trimmed, &payload); errJSON == nil {
+			switch v := payload.All.(type) {
+			case bool:
+				if v {
+					return "true"
+				}
+			case string:
+				return strings.TrimSpace(v)
+			case float64:
+				if v != 0 {
+					return "1"
+				}
+			}
+		}
+	}
+
+	// 普通形式：all=true
+	values, errParse := url.ParseQuery(string(trimmed))
+	if errParse != nil {
+		return ""
+	}
+	return strings.TrimSpace(values.Get("all"))
+}
+
+// deleteOauthRecords 删除 cli_user_oauth / cli_oauth 两张表的数据（同一个事务里，先删子表再删主表）。
+// id 为空表示“全删”；否则表示删除指定 ID。
+func deleteOauthRecords(ctx context.Context, id string) error {
+	_, err := zorm.Transaction(ctx, func(txCtx context.Context) (interface{}, error) {
+		userOauthFinder := zorm.NewDeleteFinder((&entity.CLIUserOauth{}).GetTableName())
+		if strings.TrimSpace(id) != "" {
+			userOauthFinder.Append(" where cli_oauth_id=?", id)
+		}
+		if _, errDel := zorm.UpdateFinder(txCtx, userOauthFinder); errDel != nil {
+			return nil, fmt.Errorf("删除 cli_user_oauth 失败: %w", errDel)
+		}
+
+		oauthFinder := zorm.NewDeleteFinder((&entity.CLIOauth{}).GetTableName())
+		if strings.TrimSpace(id) != "" {
+			oauthFinder.Append(" where id=?", id)
+		}
+		if _, errDel := zorm.UpdateFinder(txCtx, oauthFinder); errDel != nil {
+			return nil, fmt.Errorf("删除 cli_oauth 失败: %w", errDel)
+		}
+		return nil, nil
+	})
+	return err
 }
 
 func (h *Handler) findAuthForDelete(name string) *coreauth.Auth {
@@ -1210,8 +1467,15 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	now := time.Now()
 	oauthID := fmt.Sprintf("oauth_%d", now.UnixNano())
 
-	// Extract cli_user_id from request context, default to "u_10001"
-	cliUserID := "u_10001"
+	// 提取 cli_user_id：
+	// - 优先使用请求里传的 cli_user_id
+	// - 没传则使用 config.yaml 的 cli-user-id
+	cliUserID := config.DefaultCLIUserID
+	if h != nil && h.cfg != nil {
+		if v := strings.TrimSpace(h.cfg.CLIUserID); v != "" {
+			cliUserID = v
+		}
+	}
 	if reqInfo := coreauth.GetRequestInfo(ctx); reqInfo != nil {
 		if uid := strings.TrimSpace(reqInfo.Query.Get("cli_user_id")); uid != "" {
 			cliUserID = uid
@@ -1275,8 +1539,8 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 			CreatedAt: now,
 			UpdatedAt: now,
 			Attributes: map[string]string{
-				"path":         oauthID,
-				"runtime_only": "true",
+				// 用 oauthID 作为“路径/来源”标识，供管理接口下载/删除时定位数据库记录。
+				"path": oauthID,
 			},
 		}
 		if email := strings.TrimSpace(valueAsString(fullMetadata["email"])); email != "" {

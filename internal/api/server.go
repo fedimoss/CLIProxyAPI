@@ -649,7 +649,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
 		// mgmt.GET("/auth-files/download", s.mgmt.DownloadAuthFile)
 		mgmt.GET("/auth-files/download", s.mgmt.DownloadAuthData)
-		mgmt.POST("/auth-files", s.mgmt.UploadAuthFile)
+		// mgmt.POST("/auth-files", s.mgmt.UploadAuthFile) // 原方法保留：后续拉取上游代码时更不容易冲突，需要回退时也更简单
+		mgmt.POST("/auth-files", s.mgmt.UploadAuthFileV2)
 		// mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
 		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthData)
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
