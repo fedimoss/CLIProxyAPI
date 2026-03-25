@@ -3,24 +3,24 @@
 -- ----------------------------
 -- Table structure for table cli_oauth
 -- ----------------------------
-DROP TABLE IF EXISTS "cli_oauth";
-CREATE TABLE "cli_oauth" (
-  "id"         varchar(50) COLLATE "pg_catalog"."default" NOT NULL,
-  "oauth"      text COLLATE "pg_catalog"."default" NOT NULL,
-  "model_type" int4 NOT NULL DEFAULT 0,
+DROP TABLE IF EXISTS "public"."cli_oauth";
+CREATE TABLE "public"."cli_oauth" (
+  "id" varchar(50) COLLATE "pg_catalog"."default" NOT NULL,
+  "oauth" text COLLATE "pg_catalog"."default" NOT NULL,
+  "model_type" int4 NOT NULL,
   "created_at" timestamptz(6),
   "updated_at" timestamptz(6),
-  "status"     int8 DEFAULT 1
-);
-
-COMMENT ON TABLE "cli_oauth" IS 'CLI OAuth 凭证表';
-COMMENT ON COLUMN "cli_oauth"."id" IS 'ID';
-COMMENT ON COLUMN "cli_oauth"."oauth" IS 'OAuth 凭证';
-COMMENT ON COLUMN "cli_oauth"."model_type" IS '模型类型 (1:Codex 2:Claude/Anthropic 3:Qwen 4:Gemini/Antigravity 5:Kimi 6:iFlow)';
-COMMENT ON COLUMN "cli_oauth"."created_at" IS '创建时间';
-COMMENT ON COLUMN "cli_oauth"."updated_at" IS '更新时间';
-COMMENT ON COLUMN "cli_oauth"."status" IS '状态 (1:正常 2:禁用)';
-
+  "status" int8,
+  "account_id" varchar(250) COLLATE "pg_catalog"."default"
+)
+;
+COMMENT ON COLUMN "public"."cli_oauth"."id" IS 'ID';
+COMMENT ON COLUMN "public"."cli_oauth"."oauth" IS 'OAuth 凭证';
+COMMENT ON COLUMN "public"."cli_oauth"."model_type" IS '1: Codex 2: Anthropic 3: Qwen';
+COMMENT ON COLUMN "public"."cli_oauth"."created_at" IS '创建时间';
+COMMENT ON COLUMN "public"."cli_oauth"."updated_at" IS '更新时间';
+COMMENT ON COLUMN "public"."cli_oauth"."status" IS '状态 (1:正常 2:禁用)';
+COMMENT ON COLUMN "public"."cli_oauth"."account_id" IS '账户ID';
 -- ----------------------------
 -- Primary Key structure for table cli_oauth
 -- ----------------------------
