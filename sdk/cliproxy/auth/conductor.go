@@ -1705,6 +1705,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 
 	shouldResumeModel := false
 	shouldSuspendModel := false
+	shouldUnregisterClient := false
 	suspendReason := ""
 	clearModelQuota := false
 	setModelQuota := false
@@ -1731,7 +1732,19 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				clearAuthStateOnSuccess(auth, now)
 			}
 		} else {
-			if result.Model != "" {
+			// 请求失败后，先尝试判断这次失败是否属于“这个 OAuth 已经永久失效”的情况。
+			// 如果命中这种情况，就不要再把它当作临时失败处理，而是直接走自动停用流程。
+			if reason, okDisable := autoDisableReason(result.Error); okDisable {
+				// 第一步：把当前 auth 改成禁用状态，并把原始错误串挂到状态里。
+				disableAuthForPermanentFailure(auth, result, reason, now)
+				// 第二步：立刻写回数据库，保证服务重启后仍然保持禁用。
+				_ = m.persist(ctx, auth)
+				// 第三步：准备一份最新快照，后面交给调度器和管理页同步显示。
+				authSnapshot = auth.Clone()
+				// 第四步：标记稍后撤掉这个 auth 对应的模型注册。
+				// 这样后续请求路由时，就不会再选到它。
+				shouldUnregisterClient = true
+			} else if result.Model != "" {
 				state := ensureModelState(auth, result.Model)
 				state.Unavailable = true
 				state.Status = StatusError
@@ -1808,10 +1821,17 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
-		_ = m.persist(ctx, auth)
-		authSnapshot = auth.Clone()
+		if !shouldUnregisterClient {
+			_ = m.persist(ctx, auth)
+			authSnapshot = auth.Clone()
+		}
 	}
 	m.mu.Unlock()
+	if shouldUnregisterClient {
+		// 这里才真正把这个 auth 对应的模型从注册表里移除。
+		// 即使它还保留在内存 auth 列表中，也不会再参与后续请求路由。
+		registry.GetGlobalRegistry().UnregisterClient(result.AuthID)
+	}
 	if m.scheduler != nil && authSnapshot != nil {
 		m.scheduler.upsertAuth(authSnapshot)
 	}
@@ -2129,6 +2149,131 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.StatusMessage = "request failed"
 		}
 	}
+}
+
+// autoDisableReason 只做一件事：判断这次失败是否应该触发“自动停用”。
+// 如果应该停用，就把上游原始错误串原样返回给后续流程使用。
+func autoDisableReason(resultErr *Error) (string, bool) {
+	// 没有错误对象，或者状态码不是 401，就直接结束。
+	// 也就是说，自动停用逻辑只会在 401 错误里继续往下走。
+	if resultErr == nil || statusCodeFromResult(resultErr) != http.StatusUnauthorized {
+		return "", false
+	}
+	// 走到这里，说明已经确认是 401。
+	// 接下来再继续看：这个 401 到底是暂时失效，还是永久失效。
+	if permanentDisableReasonFromMessage(resultErr.Message) != "" {
+		// 命中后直接返回原始错误串。
+		// 后面会把它用于内存状态、数据库保存、前端展示。
+		return strings.TrimSpace(resultErr.Message), true
+	}
+	return "", false
+}
+
+// permanentDisableReasonFromMessage 专门负责识别：
+// 哪些 401 错误属于“这个 OAuth 已经失效，继续重试没有意义”的情况。
+// 当前只处理像 account_deactivated、token_invalidated 这类明确不会自行恢复的情况。
+func permanentDisableReasonFromMessage(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+
+	type providerErrorBody struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	}
+	type providerErrorEnvelope struct {
+		Code    string            `json:"code"`
+		Message string            `json:"message"`
+		Error   providerErrorBody `json:"error"`
+	}
+
+	// 先尽量按标准 JSON 错误结构解析。
+	// 大多数上游返回都能走到这里，也是后续最推荐扩展新条件的位置。
+	var parsed providerErrorEnvelope
+	if json.Valid([]byte(raw)) && json.Unmarshal([]byte(raw), &parsed) == nil {
+		// 第一层优先看 error.code。
+		// 因为这里最稳定，不容易受 message 文案变化影响。
+		if strings.EqualFold(strings.TrimSpace(parsed.Error.Code), "account_deactivated") {
+			return raw
+		}
+		if strings.EqualFold(strings.TrimSpace(parsed.Error.Code), "token_invalidated") {
+			return raw
+		}
+		// 第二层兼容外层 code。
+		// 有些上游不会把 code 放进 error 对象里，所以这里也顺手兼容。
+		if strings.EqualFold(strings.TrimSpace(parsed.Code), "account_deactivated") {
+			return raw
+		}
+		if strings.EqualFold(strings.TrimSpace(parsed.Code), "token_invalidated") {
+			return raw
+		}
+	}
+
+	lower := strings.ToLower(raw)
+	// 如果没法按 JSON 正常识别，就退回到字符串关键字匹配。
+	// 这是兜底逻辑，目的是避免因为返回格式轻微变化而漏掉明显的永久失效错误。
+	if strings.Contains(lower, "account_deactivated") ||
+		strings.Contains(lower, "has been deactivated") ||
+		strings.Contains(lower, "token_invalidated") ||
+		strings.Contains(lower, "authentication token has been invalidated") {
+		return raw
+	}
+	return ""
+}
+
+// disableAuthForPermanentFailure 负责把一个已经确认永久失效的 auth
+// 切换成禁用状态，并清掉所有“它还可以稍后再试”的痕迹。
+func disableAuthForPermanentFailure(auth *Auth, result Result, reason string, now time.Time) {
+	if auth == nil {
+		return
+	}
+	statusMessage := FormatAutoDisabledStatusMessage(reason, now)
+	// 先处理 auth 级别状态：
+	// - Disabled=true 表示这个 auth 已明确不可再用
+	// - Unavailable=false 表示它不是“暂时不可用”，而是“已经下线”
+	// - NextRetryAfter/Quota 清空，避免它继续走重试和限额恢复逻辑
+	auth.Disabled = true
+	auth.Unavailable = false
+	auth.Status = StatusDisabled
+	auth.StatusMessage = statusMessage
+	auth.UpdatedAt = now
+	auth.NextRetryAfter = time.Time{}
+	auth.Quota = QuotaState{}
+	// LastError 继续保留原始错误串，后面数据库保存和前端展示都要用到它。
+	auth.LastError = disabledResultError(result.Error, reason)
+
+	if result.Model == "" {
+		// 如果这次失败不是某个具体模型触发的，到这里就够了。
+		return
+	}
+	state := ensureModelState(auth, result.Model)
+	// 如果这次失败是某个具体模型触发的，
+	// 这里再把模型级状态也同步改成禁用，保证 auth 级和模型级显示一致。
+	state.Status = StatusDisabled
+	state.StatusMessage = statusMessage
+	state.Unavailable = false
+	state.NextRetryAfter = time.Time{}
+	state.Quota = QuotaState{}
+	state.UpdatedAt = now
+	state.LastError = disabledResultError(result.Error, reason)
+}
+
+func disabledResultError(resultErr *Error, reason string) *Error {
+	if resultErr == nil {
+		// 极端情况下如果拿不到上游错误对象，
+		// 就手动补一个兜底错误，避免后续落库和展示时拿不到原因。
+		return &Error{Code: "account_deactivated", Message: reason, HTTPStatus: http.StatusUnauthorized}
+	}
+	cloned := cloneError(resultErr)
+	// 尽量补齐错误码和状态码，保证后续状态展示、数据库记录更稳定。
+	if strings.TrimSpace(cloned.Code) == "" {
+		cloned.Code = "account_deactivated"
+	}
+	if cloned.HTTPStatus == 0 {
+		cloned.HTTPStatus = http.StatusUnauthorized
+	}
+	return cloned
 }
 
 // nextQuotaCooldown returns the next cooldown duration and updated backoff level for repeated quota errors.

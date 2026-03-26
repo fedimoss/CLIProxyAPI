@@ -6,17 +6,18 @@ import (
 	"gitee.com/chunanyong/zorm"
 )
 
-// CLIOauth 对应数据库 cli_oauth 表
+// CLIOauth maps to the cli_oauth table.
 type CLIOauth struct {
 	zorm.EntityStruct
 	ID        string     `column:"id" json:"id"`
 	Oauth     string     `column:"oauth" json:"oauth"`
-	ModelType int        `column:"model_type" json:"modelType"` // 1: Codex 2: Anthropic 3: Qwen
+	ModelType int        `column:"model_type" json:"modelType"`
 	CreatedAt *time.Time `column:"created_at" json:"createdAt"`
 	UpdatedAt *time.Time `column:"updated_at" json:"updatedAt"`
-	Status    int        `column:"status" json:"status"` // 1:正常 2:禁用
-	// AccountID：仅在 model_type=1（Codex）时使用，用于从 OAuth JSON 里提取并落库，便于做“同用户去重/更新”。
-	AccountID string `column:"account_id" json:"accountId"`
+	Status    int        `column:"status" json:"status"`
+	// ErrorReason 保存原始上游错误文本，便于后续排查。
+	ErrorReason string `column:"error_reason" json:"errorReason"`
+	AccountID   string `column:"account_id" json:"accountId"`
 }
 
 func (e *CLIOauth) GetTableName() string {
@@ -27,12 +28,12 @@ func (e *CLIOauth) GetPKColumnName() string {
 	return "id"
 }
 
-// CLIUser 对应数据库 cli_user 表
+// CLIUser maps to the cli_user table.
 type CLIUser struct {
 	zorm.EntityStruct
 	ID        string     `column:"id" json:"id"`
-	Status    int        `column:"status" json:"status"`  // 1:正常 2:禁用 3:删除
-	UserID    string     `column:"user_id" json:"userId"` // 用户ID
+	Status    int        `column:"status" json:"status"`
+	UserID    string     `column:"user_id" json:"userId"`
 	CreatedAt *time.Time `column:"created_at" json:"createdAt"`
 	UpdatedAt *time.Time `column:"updated_at" json:"updatedAt"`
 }
@@ -45,7 +46,7 @@ func (e *CLIUser) GetPKColumnName() string {
 	return "id"
 }
 
-// CLIUserOauth 对应数据库 cli_user_oauth 表
+// CLIUserOauth maps to the cli_user_oauth table.
 type CLIUserOauth struct {
 	zorm.EntityStruct
 	ID         string `column:"id" json:"id"`

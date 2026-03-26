@@ -1457,7 +1457,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		status = 2
 	}
 
-	finder.Append("status=?, updated_at=? where id=?", status, time.Now(), name)
+	finder.Append("status=?, updated_at=?, error_reason=? where id=?", status, time.Now(), "", name)
 
 	// 执行事务更新
 	_, err := zorm.Transaction(ctx, func(txCtx context.Context) (interface{}, error) {
@@ -1739,7 +1739,7 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 			_, errUpdate := zorm.Transaction(ctx, func(txCtx context.Context) (interface{}, error) {
 				updateFinder := zorm.NewUpdateFinder((&entity.CLIOauth{}).GetTableName())
 				// 只更新 oauth 内容与更新时间；status（启用/禁用）保持不变，避免覆盖用户手动操作。
-				updateFinder.Append("oauth=?, updated_at=?, account_id=? where id=?", string(oauthJSON), now, accountID, existingID)
+				updateFinder.Append("oauth=?, updated_at=?, account_id=?, error_reason=? where id=?", string(oauthJSON), now, accountID, "", existingID)
 				if _, errExec := zorm.UpdateFinder(txCtx, updateFinder); errExec != nil {
 					return nil, fmt.Errorf("update cli_oauth failed: %w", errExec)
 				}
@@ -1827,13 +1827,14 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	_, err = zorm.Transaction(ctx, func(txCtx context.Context) (interface{}, error) {
 		// Insert cli_oauth record
 		oauthRecord := &entity.CLIOauth{
-			ID:        oauthID,
-			Oauth:     string(oauthJSON),
-			ModelType: modelType,
-			AccountID: accountID,
-			Status:    1, // 默认启用状态
-			CreatedAt: &now,
-			UpdatedAt: &now,
+			ID:          oauthID,
+			Oauth:       string(oauthJSON),
+			ModelType:   modelType,
+			AccountID:   accountID,
+			ErrorReason: "",
+			Status:      1, // 默认启用状态
+			CreatedAt:   &now,
+			UpdatedAt:   &now,
 		}
 		if _, errInsert := zorm.Insert(txCtx, oauthRecord); errInsert != nil {
 			return nil, fmt.Errorf("insert cli_oauth failed: %w", errInsert)

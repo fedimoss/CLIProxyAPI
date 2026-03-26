@@ -408,6 +408,312 @@ func TestManagerExecuteStream_ModelSupportBadRequestFallsBackAndSuspendsAuth(t *
 	}
 }
 
+func TestManager_AccountDeactivatedUnauthorized_AutoDisablesAuthAndFallsBack(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	rawReason := `{"error":{"message":"Your OpenAI account has been deactivated, please check your email for more information.","type":"invalid_request_error","code":"account_deactivated"},"status":401}`
+	executor := &authFallbackExecutor{
+		id: "claude",
+		executeErrors: map[string]error{
+			"aa-bad-auth": &Error{
+				HTTPStatus: http.StatusUnauthorized,
+				Message:    rawReason,
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "claude-opus-4-6"
+	badAuth := &Auth{ID: "aa-bad-auth", Provider: "claude"}
+	goodAuth := &Auth{ID: "bb-good-auth", Provider: "claude"}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(badAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(goodAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(badAuth.ID)
+		reg.UnregisterClient(goodAuth.ID)
+	})
+
+	if _, err := m.Register(context.Background(), badAuth); err != nil {
+		t.Fatalf("register bad auth: %v", err)
+	}
+	if _, err := m.Register(context.Background(), goodAuth); err != nil {
+		t.Fatalf("register good auth: %v", err)
+	}
+
+	request := cliproxyexecutor.Request{Model: model}
+	for i := 0; i < 2; i++ {
+		resp, err := m.Execute(context.Background(), []string{"claude"}, request, cliproxyexecutor.Options{})
+		if err != nil {
+			t.Fatalf("execute %d error = %v, want success", i, err)
+		}
+		if string(resp.Payload) != goodAuth.ID {
+			t.Fatalf("execute %d payload = %q, want %q", i, string(resp.Payload), goodAuth.ID)
+		}
+	}
+
+	got := executor.ExecuteCalls()
+	want := []string{badAuth.ID, goodAuth.ID, goodAuth.ID}
+	if len(got) != len(want) {
+		t.Fatalf("execute calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("execute call %d auth = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	updatedBad, ok := m.GetByID(badAuth.ID)
+	if !ok || updatedBad == nil {
+		t.Fatalf("expected bad auth to remain registered")
+	}
+	if !updatedBad.Disabled || updatedBad.Status != StatusDisabled {
+		t.Fatalf("bad auth status = disabled:%v status:%s, want disabled auth", updatedBad.Disabled, updatedBad.Status)
+	}
+	if updatedBad.StatusMessage != rawReason {
+		t.Fatalf("status message = %q, want raw reason %q", updatedBad.StatusMessage, rawReason)
+	}
+	if updatedBad.LastError == nil || updatedBad.LastError.Message != rawReason {
+		t.Fatalf("last error = %#v, want raw reason %q", updatedBad.LastError, rawReason)
+	}
+	if models := reg.GetModelsForClient(badAuth.ID); len(models) != 0 {
+		t.Fatalf("bad auth models = %v, want empty after auto-disable", models)
+	}
+}
+
+func TestManagerExecuteStream_AccountDeactivatedUnauthorized_AutoDisablesAuthAndFallsBack(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	rawReason := `{"error":{"message":"Your OpenAI account has been deactivated, please check your email for more information.","type":"invalid_request_error","code":"account_deactivated"},"status":401}`
+	executor := &authFallbackExecutor{
+		id: "claude",
+		streamFirstErrors: map[string]error{
+			"aa-bad-auth": &Error{
+				HTTPStatus: http.StatusUnauthorized,
+				Message:    rawReason,
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "claude-opus-4-6"
+	badAuth := &Auth{ID: "aa-bad-auth", Provider: "claude"}
+	goodAuth := &Auth{ID: "bb-good-auth", Provider: "claude"}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(badAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(goodAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(badAuth.ID)
+		reg.UnregisterClient(goodAuth.ID)
+	})
+
+	if _, err := m.Register(context.Background(), badAuth); err != nil {
+		t.Fatalf("register bad auth: %v", err)
+	}
+	if _, err := m.Register(context.Background(), goodAuth); err != nil {
+		t.Fatalf("register good auth: %v", err)
+	}
+
+	request := cliproxyexecutor.Request{Model: model}
+	for i := 0; i < 2; i++ {
+		streamResult, err := m.ExecuteStream(context.Background(), []string{"claude"}, request, cliproxyexecutor.Options{})
+		if err != nil {
+			t.Fatalf("execute stream %d error = %v, want success", i, err)
+		}
+		var payload []byte
+		for chunk := range streamResult.Chunks {
+			if chunk.Err != nil {
+				t.Fatalf("execute stream %d chunk error = %v, want success", i, chunk.Err)
+			}
+			payload = append(payload, chunk.Payload...)
+		}
+		if string(payload) != goodAuth.ID {
+			t.Fatalf("execute stream %d payload = %q, want %q", i, string(payload), goodAuth.ID)
+		}
+	}
+
+	got := executor.StreamCalls()
+	want := []string{badAuth.ID, goodAuth.ID, goodAuth.ID}
+	if len(got) != len(want) {
+		t.Fatalf("stream calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("stream call %d auth = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	updatedBad, ok := m.GetByID(badAuth.ID)
+	if !ok || updatedBad == nil {
+		t.Fatalf("expected bad auth to remain registered")
+	}
+	if !updatedBad.Disabled || updatedBad.Status != StatusDisabled {
+		t.Fatalf("bad auth status = disabled:%v status:%s, want disabled auth", updatedBad.Disabled, updatedBad.Status)
+	}
+	if updatedBad.StatusMessage != rawReason {
+		t.Fatalf("status message = %q, want raw reason %q", updatedBad.StatusMessage, rawReason)
+	}
+	if updatedBad.LastError == nil || updatedBad.LastError.Message != rawReason {
+		t.Fatalf("last error = %#v, want raw reason %q", updatedBad.LastError, rawReason)
+	}
+	if models := reg.GetModelsForClient(badAuth.ID); len(models) != 0 {
+		t.Fatalf("bad auth models = %v, want empty after auto-disable", models)
+	}
+}
+
+func TestManager_TokenInvalidatedUnauthorized_AutoDisablesAuthAndFallsBack(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	rawReason := `{"error":{"message":"Your authentication token has been invalidated. Please try signing in again.","type":"invalid_request_error","code":"token_invalidated"},"status":401}`
+	executor := &authFallbackExecutor{
+		id: "claude",
+		executeErrors: map[string]error{
+			"aa-bad-auth": &Error{
+				HTTPStatus: http.StatusUnauthorized,
+				Message:    rawReason,
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "claude-opus-4-6"
+	badAuth := &Auth{ID: "aa-bad-auth", Provider: "claude"}
+	goodAuth := &Auth{ID: "bb-good-auth", Provider: "claude"}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(badAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(goodAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(badAuth.ID)
+		reg.UnregisterClient(goodAuth.ID)
+	})
+
+	if _, err := m.Register(context.Background(), badAuth); err != nil {
+		t.Fatalf("register bad auth: %v", err)
+	}
+	if _, err := m.Register(context.Background(), goodAuth); err != nil {
+		t.Fatalf("register good auth: %v", err)
+	}
+
+	request := cliproxyexecutor.Request{Model: model}
+	for i := 0; i < 2; i++ {
+		resp, err := m.Execute(context.Background(), []string{"claude"}, request, cliproxyexecutor.Options{})
+		if err != nil {
+			t.Fatalf("execute %d error = %v, want success", i, err)
+		}
+		if string(resp.Payload) != goodAuth.ID {
+			t.Fatalf("execute %d payload = %q, want %q", i, string(resp.Payload), goodAuth.ID)
+		}
+	}
+
+	got := executor.ExecuteCalls()
+	want := []string{badAuth.ID, goodAuth.ID, goodAuth.ID}
+	if len(got) != len(want) {
+		t.Fatalf("execute calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("execute call %d auth = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	updatedBad, ok := m.GetByID(badAuth.ID)
+	if !ok || updatedBad == nil {
+		t.Fatalf("expected bad auth to remain registered")
+	}
+	if !updatedBad.Disabled || updatedBad.Status != StatusDisabled {
+		t.Fatalf("bad auth status = disabled:%v status:%s, want disabled auth", updatedBad.Disabled, updatedBad.Status)
+	}
+	if updatedBad.StatusMessage != rawReason {
+		t.Fatalf("status message = %q, want raw reason %q", updatedBad.StatusMessage, rawReason)
+	}
+	if updatedBad.LastError == nil || updatedBad.LastError.Message != rawReason {
+		t.Fatalf("last error = %#v, want raw reason %q", updatedBad.LastError, rawReason)
+	}
+	if models := reg.GetModelsForClient(badAuth.ID); len(models) != 0 {
+		t.Fatalf("bad auth models = %v, want empty after auto-disable", models)
+	}
+}
+
+func TestManagerExecuteStream_TokenInvalidatedUnauthorized_AutoDisablesAuthAndFallsBack(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	rawReason := `{"error":{"message":"Your authentication token has been invalidated. Please try signing in again.","type":"invalid_request_error","code":"token_invalidated"},"status":401}`
+	executor := &authFallbackExecutor{
+		id: "claude",
+		streamFirstErrors: map[string]error{
+			"aa-bad-auth": &Error{
+				HTTPStatus: http.StatusUnauthorized,
+				Message:    rawReason,
+			},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "claude-opus-4-6"
+	badAuth := &Auth{ID: "aa-bad-auth", Provider: "claude"}
+	goodAuth := &Auth{ID: "bb-good-auth", Provider: "claude"}
+
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(badAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	reg.RegisterClient(goodAuth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(badAuth.ID)
+		reg.UnregisterClient(goodAuth.ID)
+	})
+
+	if _, err := m.Register(context.Background(), badAuth); err != nil {
+		t.Fatalf("register bad auth: %v", err)
+	}
+	if _, err := m.Register(context.Background(), goodAuth); err != nil {
+		t.Fatalf("register good auth: %v", err)
+	}
+
+	request := cliproxyexecutor.Request{Model: model}
+	for i := 0; i < 2; i++ {
+		streamResult, err := m.ExecuteStream(context.Background(), []string{"claude"}, request, cliproxyexecutor.Options{})
+		if err != nil {
+			t.Fatalf("execute stream %d error = %v, want success", i, err)
+		}
+		var payload []byte
+		for chunk := range streamResult.Chunks {
+			if chunk.Err != nil {
+				t.Fatalf("execute stream %d chunk error = %v, want success", i, chunk.Err)
+			}
+			payload = append(payload, chunk.Payload...)
+		}
+		if string(payload) != goodAuth.ID {
+			t.Fatalf("execute stream %d payload = %q, want %q", i, string(payload), goodAuth.ID)
+		}
+	}
+
+	got := executor.StreamCalls()
+	want := []string{badAuth.ID, goodAuth.ID, goodAuth.ID}
+	if len(got) != len(want) {
+		t.Fatalf("stream calls = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("stream call %d auth = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	updatedBad, ok := m.GetByID(badAuth.ID)
+	if !ok || updatedBad == nil {
+		t.Fatalf("expected bad auth to remain registered")
+	}
+	if !updatedBad.Disabled || updatedBad.Status != StatusDisabled {
+		t.Fatalf("bad auth status = disabled:%v status:%s, want disabled auth", updatedBad.Disabled, updatedBad.Status)
+	}
+	if updatedBad.StatusMessage != rawReason {
+		t.Fatalf("status message = %q, want raw reason %q", updatedBad.StatusMessage, rawReason)
+	}
+	if updatedBad.LastError == nil || updatedBad.LastError.Message != rawReason {
+		t.Fatalf("last error = %#v, want raw reason %q", updatedBad.LastError, rawReason)
+	}
+	if models := reg.GetModelsForClient(badAuth.ID); len(models) != 0 {
+		t.Fatalf("bad auth models = %v, want empty after auto-disable", models)
+	}
+}
+
 func TestManager_MarkResult_RespectsAuthDisableCoolingOverride(t *testing.T) {
 	prev := quotaCooldownDisabled.Load()
 	quotaCooldownDisabled.Store(false)

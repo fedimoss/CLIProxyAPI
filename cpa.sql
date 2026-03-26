@@ -11,6 +11,7 @@ CREATE TABLE "public"."cli_oauth" (
   "created_at" timestamptz(6),
   "updated_at" timestamptz(6),
   "status" int8,
+  "error_reason" text COLLATE "pg_catalog"."default",
   "account_id" varchar(250) COLLATE "pg_catalog"."default"
 )
 ;

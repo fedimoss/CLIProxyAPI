@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"flag"
 	"fmt"
@@ -72,6 +73,36 @@ func initDB(cfg *config.Config) error {
 	log.Infof("数据库已连接")
 	_ = dbDao
 
+	return nil
+}
+
+// ensureCLIOauthSchema 负责给旧库补齐 cli_oauth 的新增字段，
+// 避免升级后因为缺列导致启动或落库失败。
+func ensureCLIOauthSchema(cfg *config.Config) error {
+	if cfg == nil {
+		return nil
+	}
+	driverName := strings.TrimSpace(cfg.Database.DriverName)
+	dialect := strings.ToLower(strings.TrimSpace(cfg.Database.Dialect))
+	dsn := strings.TrimSpace(cfg.Database.DSN)
+	if driverName == "" || dsn == "" {
+		return nil
+	}
+	if !strings.Contains(strings.ToLower(driverName), "postgres") && !strings.Contains(dialect, "postgres") {
+		return nil
+	}
+
+	db, err := sql.Open(driverName, dsn)
+	if err != nil {
+		return fmt.Errorf("ensure cli_oauth schema failed: %w", err)
+	}
+	defer db.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := db.ExecContext(ctx, `ALTER TABLE IF EXISTS cli_oauth ADD COLUMN IF NOT EXISTS error_reason text`); err != nil {
+		return fmt.Errorf("ensure cli_oauth.error_reason failed: %w", err)
+	}
 	return nil
 }
 
@@ -466,6 +497,11 @@ func main() {
 	// Initialize database connection
 	if err := initDB(cfg); err != nil {
 		log.Errorf("failed to initialize database: %v", err)
+		return
+	}
+	// 对已有数据库做轻量补列，保证新版本逻辑可以直接使用。
+	if err := ensureCLIOauthSchema(cfg); err != nil {
+		log.Errorf("failed to update cli_oauth schema: %v", err)
 		return
 	}
 

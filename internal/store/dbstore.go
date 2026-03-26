@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -12,21 +13,21 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
-// DBTokenStore 基于 zorm 和 cli_oauth 表实现 coreauth.Store 接口
+// DBTokenStore 基于 zorm 和 cli_oauth 表实现 auth 存储。
 type DBTokenStore struct{}
 
-// NewDBTokenStore 创建数据库 Token 存储实例
+// NewDBTokenStore 创建数据库 Token 存储实例。
 func NewDBTokenStore() *DBTokenStore {
 	return &DBTokenStore{}
 }
 
-// SetBaseDir 数据库存储不需要目录，空实现（满足 Manager 可选接口）
+// SetBaseDir 数据库存储不依赖目录，保留空实现以兼容调用方接口。
 func (s *DBTokenStore) SetBaseDir(_ string) {}
 
-// SkipFileAuth 标识该存储独立于文件系统管理 auth，Watcher 据此跳过文件扫描
+// SkipFileAuth 表示该存储独立于文件系统，不需要文件监听器参与。
 func (s *DBTokenStore) SkipFileAuth() bool { return true }
 
-// List 从 cli_oauth 表查询所有 auth 记录
+// List 从 cli_oauth 表查询所有 auth 记录。
 func (s *DBTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) {
 	finder := zorm.NewSelectFinder((&entity.CLIOauth{}).GetTableName())
 	finder.Append(" order by created_at desc")
@@ -47,7 +48,7 @@ func (s *DBTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) {
 	return auths, nil
 }
 
-// Save 将 auth 记录保存到 cli_oauth 表（存在则更新，不存在则插入）
+// Save 将 auth 记录保存到 cli_oauth 表。
 func (s *DBTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
 	if auth == nil {
 		return "", fmt.Errorf("dbstore: auth 为空")
@@ -72,21 +73,13 @@ func (s *DBTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (strin
 	}
 	record.ID = auth.ID
 
-	// 查询是否已存在
 	existing, err := s.findByID(ctx, auth.ID)
 	if err != nil {
 		return "", fmt.Errorf("dbstore: 查询已有记录失败: %w", err)
 	}
 
-	// IMPORTANT:
-	// cli_oauth.status 在数据库里约定：1=正常, 2=禁用（允许 NULL）。
-	// entity.CLIOauth.Status 是 int，零值=0；如果不显式赋值，zorm Insert/Update 可能会把 0 写入数据库
-	// （尤其是 Update 会覆盖原有 status）。
-	//
-	// 规则：
-	// - 如果 auth 显式为禁用（Disabled 或 StatusDisabled），写 2
-	// - 否则更新时保留数据库已有状态（避免刷新 token 时意外“启用/禁用”）
-	// - 插入时默认写 1（避免出现 0）
+	// cli_oauth.status 约定：1=正常，2=禁用。
+	// 如果当前 auth 已明确停用，就写 2；否则保留数据库原状态，避免刷新时误改状态。
 	status := 1
 	if existing != nil && existing.Status != 0 {
 		status = existing.Status
@@ -95,6 +88,16 @@ func (s *DBTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (strin
 		status = 2
 	}
 	record.Status = status
+	if status == 2 {
+		// 只要当前记录已经是禁用状态，就把原始错误串写入 error_reason。
+		// 这样后面无论是重启恢复，还是前端查看，都能看到同一份原始错误内容。
+		record.ErrorReason = disabledErrorReason(auth)
+		if record.ErrorReason == "" && existing != nil {
+			// 如果这次内存里没带错误串，就沿用数据库里已有的那份。
+			// 这样可以避免一次普通更新把原来的停用原因冲掉。
+			record.ErrorReason = strings.TrimSpace(existing.ErrorReason)
+		}
+	}
 
 	_, err = zorm.Transaction(ctx, func(txCtx context.Context) (interface{}, error) {
 		if existing != nil {
@@ -118,7 +121,7 @@ func (s *DBTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (strin
 	return auth.ID, nil
 }
 
-// Delete 按 ID 从 cli_oauth 表删除记录
+// Delete 按 ID 删除 cli_oauth 记录。
 func (s *DBTokenStore) Delete(ctx context.Context, id string) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -137,7 +140,7 @@ func (s *DBTokenStore) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-// findByID 按 ID 查询单条 cli_oauth 记录
+// findByID 按 ID 查询单条 cli_oauth 记录。
 func (s *DBTokenStore) findByID(ctx context.Context, id string) (*entity.CLIOauth, error) {
 	finder := zorm.NewSelectFinder((&entity.CLIOauth{}).GetTableName())
 	finder.Append(" where id=?", id)
@@ -152,20 +155,20 @@ func (s *DBTokenStore) findByID(ctx context.Context, id string) (*entity.CLIOaut
 	return &list[0], nil
 }
 
-// rowToAuth 将 CLIOauth 数据库记录转换为 *cliproxyauth.Auth
+// rowToAuth 将 CLIOauth 数据库记录转换为运行时 auth 对象。
 func (s *DBTokenStore) rowToAuth(item entity.CLIOauth) (*cliproxyauth.Auth, error) {
 	metadata := make(map[string]any)
 	if err := json.Unmarshal([]byte(item.Oauth), &metadata); err != nil {
 		return nil, fmt.Errorf("dbstore: 解析 %s 的 oauth JSON 失败: %w", item.ID, err)
 	}
 
-	// 从 JSON 的 type 字段获取 provider，为空时通过 model_type 推导
+	// 优先使用 oauth 原始数据里的 type，缺失时再根据 model_type 兜底。
 	provider := strings.TrimSpace(valueAsString(metadata["type"]))
 	if provider == "" {
 		provider = modelTypeToProvider(item.ModelType)
 	}
 
-	// 优先使用数据库的 status 字段（1=正常, 2=禁用），其次才检查 metadata 中的 disabled
+	// 数据库 status=2 代表明确停用；否则再回退看 metadata 里的 disabled 标记。
 	disabled := false
 	if item.Status == 2 {
 		disabled = true
@@ -178,7 +181,7 @@ func (s *DBTokenStore) rowToAuth(item entity.CLIOauth) (*cliproxyauth.Auth, erro
 		status = cliproxyauth.StatusDisabled
 	}
 
-	// 设置 path 属性为 ID，buildAuthFileEntry 依赖非空 path 来构建返回结果
+	// path 属性保持为 ID，避免管理接口构造返回数据时拿到空路径。
 	attr := map[string]string{"path": item.ID}
 	if email := strings.TrimSpace(valueAsString(metadata["email"])); email != "" {
 		attr["email"] = email
@@ -196,6 +199,16 @@ func (s *DBTokenStore) rowToAuth(item entity.CLIOauth) (*cliproxyauth.Auth, erro
 		LastRefreshedAt:  time.Time{},
 		NextRefreshAfter: time.Time{},
 	}
+	if disabled && strings.TrimSpace(item.ErrorReason) != "" {
+		// 从数据库把禁用 auth 重新读回内存时，
+		// 这里把 error_reason 再还原成运行时错误对象。
+		// 这样后面的管理页、接口返回、状态判断拿到的都是同一份原始内容。
+		auth.LastError = &cliproxyauth.Error{
+			Code:       "account_deactivated",
+			Message:    strings.TrimSpace(item.ErrorReason),
+			HTTPStatus: http.StatusUnauthorized,
+		}
+	}
 
 	if item.CreatedAt != nil {
 		auth.CreatedAt = *item.CreatedAt
@@ -203,11 +216,32 @@ func (s *DBTokenStore) rowToAuth(item entity.CLIOauth) (*cliproxyauth.Auth, erro
 	if item.UpdatedAt != nil {
 		auth.UpdatedAt = *item.UpdatedAt
 	}
+	if disabled && strings.TrimSpace(item.ErrorReason) != "" {
+		// 对外展示时，直接把原始错误串塞进状态说明。
+		// 不额外拼接时间和前缀，确保前端看到的内容和数据库里的 error_reason 完全一致。
+		rawReason := strings.TrimSpace(item.ErrorReason)
+		auth.StatusMessage = rawReason
+	}
 
 	return auth, nil
 }
 
-// providerToModelType 将 provider 字符串映射为 model_type 整数
+// disabledErrorReason 从运行时状态里取出原始错误文本，用于写入 error_reason 字段。
+func disabledErrorReason(auth *cliproxyauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.LastError != nil {
+		// 优先取运行时里最近一次失败留下的原始错误串。
+		// 这里不做任何加工，直接保留上游原文。
+		if reason := strings.TrimSpace(auth.LastError.Message); reason != "" {
+			return reason
+		}
+	}
+	return ""
+}
+
+// providerToModelType 将 provider 字符串映射为 model_type 整数。
 func providerToModelType(provider string) int {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case "codex":
@@ -227,7 +261,7 @@ func providerToModelType(provider string) int {
 	}
 }
 
-// modelTypeToProvider 将 model_type 整数反向映射为 provider 字符串
+// modelTypeToProvider 将 model_type 整数反向映射为 provider 字符串。
 func modelTypeToProvider(modelType int) string {
 	switch modelType {
 	case 1:
