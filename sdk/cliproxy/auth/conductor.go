@@ -2171,7 +2171,7 @@ func autoDisableReason(resultErr *Error) (string, bool) {
 
 // permanentDisableReasonFromMessage 专门负责识别：
 // 哪些 401 错误属于“这个 OAuth 已经失效，继续重试没有意义”的情况。
-// 当前只处理像 account_deactivated、token_invalidated 这类明确不会自行恢复的情况。
+// 当前只处理像 account_deactivated、token_invalidated、token_revoked 这类明确不会自行恢复的情况。
 func permanentDisableReasonFromMessage(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -2200,12 +2200,18 @@ func permanentDisableReasonFromMessage(raw string) string {
 		if strings.EqualFold(strings.TrimSpace(parsed.Error.Code), "token_invalidated") {
 			return raw
 		}
+		if strings.EqualFold(strings.TrimSpace(parsed.Error.Code), "token_revoked") {
+			return raw
+		}
 		// 第二层兼容外层 code。
 		// 有些上游不会把 code 放进 error 对象里，所以这里也顺手兼容。
 		if strings.EqualFold(strings.TrimSpace(parsed.Code), "account_deactivated") {
 			return raw
 		}
 		if strings.EqualFold(strings.TrimSpace(parsed.Code), "token_invalidated") {
+			return raw
+		}
+		if strings.EqualFold(strings.TrimSpace(parsed.Code), "token_revoked") {
 			return raw
 		}
 	}
@@ -2216,7 +2222,9 @@ func permanentDisableReasonFromMessage(raw string) string {
 	if strings.Contains(lower, "account_deactivated") ||
 		strings.Contains(lower, "has been deactivated") ||
 		strings.Contains(lower, "token_invalidated") ||
-		strings.Contains(lower, "authentication token has been invalidated") {
+		strings.Contains(lower, "authentication token has been invalidated") ||
+		strings.Contains(lower, "token_revoked") ||
+		strings.Contains(lower, "invalidated oauth token") {
 		return raw
 	}
 	return ""
