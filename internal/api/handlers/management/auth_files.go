@@ -1103,7 +1103,7 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 //
 // 约定：
 // - 传 `all=true/1/*`：删除全部
-// - 否则必须传 `name`（记录 ID）：删除单条
+// - 否则必须在请求体里传 `names`（记录 ID 列表）：删除指定项
 // - `all` 优先从 query 取；如果没传，再尝试从 body 里取（支持 `all=true` 或 JSON）
 func (h *Handler) DeleteAuthData(c *gin.Context) {
 	ctx := c.Request.Context()
@@ -1137,30 +1137,59 @@ func (h *Handler) DeleteAuthData(c *gin.Context) {
 		return
 	}
 
-	// 2) 单条删除：要求 name 必填（通常就是记录 ID）
-	name := strings.TrimSpace(c.Query("name"))
-	if name == "" {
-		c.JSON(400, gin.H{"error": "name is required"})
+	// 2) 指定删除：要求请求体里提供 names（通常就是记录 ID 列表）
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(400, gin.H{"error": "failed to read body"})
+		return
+	}
+
+	var payload struct {
+		Names []string `json:"names"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		c.JSON(400, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	names := uniqueAuthFileNames(payload.Names)
+	if len(names) == 0 {
+		c.JSON(400, gin.H{"error": "names is required"})
 		return
 	}
 
 	// 尽量把 name 解析成真正的 auth.ID（避免传文件名/别名时“删了库，但内存没删到”）
-	authID := name
-	if target := h.findAuthForDelete(name); target != nil && strings.TrimSpace(target.ID) != "" {
-		authID = strings.TrimSpace(target.ID)
+	deletedIDs := make([]string, 0, len(names))
+	failed := make([]gin.H, 0)
+	for _, name := range names {
+		authID := name
+		if target := h.findAuthForDelete(name); target != nil && strings.TrimSpace(target.ID) != "" {
+			authID = strings.TrimSpace(target.ID)
+		}
+
+		// 删除前先从“可用模型清单”移除，并停用内存项：
+		// 就算数据库删除失败，也不要继续让它在运行中可用。
+		registry.GetGlobalRegistry().UnregisterClient(authID)
+		h.disableAuth(ctx, authID)
+
+		if err := deleteOauthRecords(ctx, authID); err != nil {
+			failed = append(failed, gin.H{"name": name, "error": err.Error()})
+			continue
+		}
+		deletedIDs = append(deletedIDs, authID)
 	}
 
-	// 删除前先从“可用模型清单”移除，并停用内存项：
-	// 就算数据库删除失败，也不要继续让它在运行中可用。
-	registry.GetGlobalRegistry().UnregisterClient(authID)
-	h.disableAuth(ctx, authID)
-
-	if err := deleteOauthRecords(ctx, authID); err != nil {
-		c.JSON(500, gin.H{"error": fmt.Sprintf("删除数据库记录失败: %v", err)})
+	if len(failed) > 0 {
+		c.JSON(http.StatusMultiStatus, gin.H{
+			"status":  "partial",
+			"deleted": len(deletedIDs),
+			"names":   deletedIDs,
+			"failed":  failed,
+		})
 		return
 	}
 
-	c.JSON(200, gin.H{"status": "ok"})
+	c.JSON(200, gin.H{"status": "ok", "deleted": len(deletedIDs), "names": deletedIDs})
 }
 
 func isTruthyFlag(v string) bool {
