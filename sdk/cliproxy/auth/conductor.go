@@ -2182,7 +2182,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 // 当前规则很简单：外层状态码是 401，且错误内容里也能解析出 status=401，就认为应该自动停用。
 func autoDisableReason(resultErr *Error) (string, bool) {
 	// 先挡掉非 401 场景，避免把其他错误误判成需要停用。
-	if resultErr == nil || statusCodeFromResult(resultErr) != http.StatusUnauthorized {
+	if resultErr == nil {
 		return "", false
 	}
 
@@ -2194,12 +2194,20 @@ func autoDisableReason(resultErr *Error) (string, bool) {
 
 	// 这里只关心返回体里的 status 字段，不再看其他错误码或文案。
 	type providerErrorEnvelope struct {
-		Status int `json:"status"`
+		Status int    `json:"status"`
+		Detail string `json:"detail"`
 	}
 
 	var parsed providerErrorEnvelope
 	// 只有当错误内容是合法 JSON，并且里面的 status 也是 401，才真正触发自动停用。
-	if json.Valid([]byte(raw)) && json.Unmarshal([]byte(raw), &parsed) == nil && parsed.Status == http.StatusUnauthorized {
+	if !json.Valid([]byte(raw)) || json.Unmarshal([]byte(raw), &parsed) != nil {
+		return "", false
+	}
+	if statusCodeFromResult(resultErr) == http.StatusUnauthorized && parsed.Status == http.StatusUnauthorized {
+		return raw, true
+	}
+	// {"detail":"Unauthorized"}
+	if strings.EqualFold(strings.TrimSpace(parsed.Detail), "Unauthorized") {
 		return raw, true
 	}
 	return "", false
