@@ -31,6 +31,7 @@ import (
 	iflowauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/iflow"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/qwen"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/clioauth"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/entity"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
@@ -1724,7 +1725,7 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	}
 
 	// Determine model type from provider
-	modelType := providerToModelType(record.Provider)
+	modelType := clioauth.ProviderToModelType(record.Provider)
 
 	// 生成 OAuth 记录 ID（默认走“新增”路径；如果后面命中“同用户去重更新”，会改用已存在的记录 ID）
 	now := time.Now()
@@ -1947,24 +1948,7 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 // providerToModelType maps provider name to model_type integer.
 // 1: Codex 2: Anthropic 3: Qwen 4: Gemini 5: Antigravity 6: Kimi 7: IFlow
 func providerToModelType(provider string) int {
-	switch strings.ToLower(provider) {
-	case "codex", "openai":
-		return 1
-	case "claude", "anthropic":
-		return 2
-	case "qwen":
-		return 3
-	case "gemini":
-		return 4
-	case "antigravity":
-		return 5
-	case "kimi":
-		return 6
-	case "iflow":
-		return 7
-	default:
-		return 0
-	}
+	return clioauth.ProviderToModelType(provider)
 }
 
 func (h *Handler) RequestAnthropicToken(c *gin.Context) {

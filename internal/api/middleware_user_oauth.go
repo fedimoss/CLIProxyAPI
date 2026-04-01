@@ -11,6 +11,7 @@ import (
 
 	"gitee.com/chunanyong/zorm"
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/clioauth"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -145,7 +146,7 @@ func modelTypesForProviders(providers []string) []int {
 	seen := make(map[int]struct{}, len(providers))
 	out := make([]int, 0, len(providers))
 	for _, provider := range providers {
-		modelType := providerToModelType(provider)
+		modelType := clioauth.ProviderToModelType(provider)
 		if modelType == 0 {
 			continue
 		}
@@ -156,25 +157,6 @@ func modelTypesForProviders(providers []string) []int {
 		out = append(out, modelType)
 	}
 	return out
-}
-
-func providerToModelType(provider string) int {
-	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case "codex":
-		return 1
-	case "claude", "anthropic":
-		return 2
-	case "qwen":
-		return 3
-	case "gemini", "antigravity":
-		return 4
-	case "kimi":
-		return 5
-	case "iflow":
-		return 6
-	default:
-		return 0
-	}
 }
 
 func listUserOauthCandidates(ctx context.Context, cliUserID string) ([]*userOauthCandidate, error) {

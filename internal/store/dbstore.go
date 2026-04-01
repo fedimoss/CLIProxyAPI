@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"gitee.com/chunanyong/zorm"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/clioauth"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/entity"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
@@ -68,7 +69,7 @@ func (s *DBTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (strin
 	now := time.Now()
 	record := entity.CLIOauth{
 		Oauth:     string(oauthJSON),
-		ModelType: providerToModelType(auth.Provider),
+		ModelType: clioauth.ProviderToModelType(auth.Provider),
 		UpdatedAt: &now,
 	}
 	record.ID = auth.ID
@@ -165,7 +166,7 @@ func (s *DBTokenStore) rowToAuth(item entity.CLIOauth) (*cliproxyauth.Auth, erro
 	// 优先使用 oauth 原始数据里的 type，缺失时再根据 model_type 兜底。
 	provider := strings.TrimSpace(valueAsString(metadata["type"]))
 	if provider == "" {
-		provider = modelTypeToProvider(item.ModelType)
+		provider = clioauth.ModelTypeToProvider(item.ModelType)
 	}
 
 	// 数据库 status=2 代表明确停用；否则再回退看 metadata 里的 disabled 标记。
@@ -243,40 +244,10 @@ func disabledErrorReason(auth *cliproxyauth.Auth) string {
 
 // providerToModelType 将 provider 字符串映射为 model_type 整数。
 func providerToModelType(provider string) int {
-	switch strings.ToLower(strings.TrimSpace(provider)) {
-	case "codex":
-		return 1
-	case "claude", "anthropic":
-		return 2
-	case "qwen":
-		return 3
-	case "gemini", "antigravity":
-		return 4
-	case "kimi":
-		return 5
-	case "iflow":
-		return 6
-	default:
-		return 0
-	}
+	return clioauth.ProviderToModelType(provider)
 }
 
 // modelTypeToProvider 将 model_type 整数反向映射为 provider 字符串。
 func modelTypeToProvider(modelType int) string {
-	switch modelType {
-	case 1:
-		return "codex"
-	case 2:
-		return "claude"
-	case 3:
-		return "qwen"
-	case 4:
-		return "gemini"
-	case 5:
-		return "kimi"
-	case 6:
-		return "iflow"
-	default:
-		return "unknown"
-	}
+	return clioauth.ModelTypeToProvider(modelType)
 }

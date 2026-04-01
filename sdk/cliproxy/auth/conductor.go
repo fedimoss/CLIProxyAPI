@@ -2178,83 +2178,31 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	}
 }
 
-// autoDisableReason 只做一件事：判断这次失败是否应该触发“自动停用”。
-// 如果应该停用，就把上游原始错误串原样返回给后续流程使用。
+// autoDisableReason 用来判断这次失败是否应该触发“自动停用”。
+// 当前规则很简单：外层状态码是 401，且错误内容里也能解析出 status=401，就认为应该自动停用。
 func autoDisableReason(resultErr *Error) (string, bool) {
-	// 没有错误对象，或者状态码不是 401，就直接结束。
-	// 也就是说，自动停用逻辑只会在 401 错误里继续往下走。
+	// 先挡掉非 401 场景，避免把其他错误误判成需要停用。
 	if resultErr == nil || statusCodeFromResult(resultErr) != http.StatusUnauthorized {
 		return "", false
 	}
-	// 走到这里，说明已经确认是 401。
-	// 接下来再继续看：这个 401 到底是暂时失效，还是永久失效。
-	if permanentDisableReasonFromMessage(resultErr.Message) != "" {
-		// 命中后直接返回原始错误串。
-		// 后面会把它用于内存状态、数据库保存、前端展示。
-		return strings.TrimSpace(resultErr.Message), true
+
+	// 原始错误内容后面还要用于状态记录和展示，所以这里先做一次去空白处理。
+	raw := strings.TrimSpace(resultErr.Message)
+	if raw == "" {
+		return "", false
+	}
+
+	// 这里只关心返回体里的 status 字段，不再看其他错误码或文案。
+	type providerErrorEnvelope struct {
+		Status int `json:"status"`
+	}
+
+	var parsed providerErrorEnvelope
+	// 只有当错误内容是合法 JSON，并且里面的 status 也是 401，才真正触发自动停用。
+	if json.Valid([]byte(raw)) && json.Unmarshal([]byte(raw), &parsed) == nil && parsed.Status == http.StatusUnauthorized {
+		return raw, true
 	}
 	return "", false
-}
-
-// permanentDisableReasonFromMessage 专门负责识别：
-// 哪些 401 错误属于“这个 OAuth 已经失效，继续重试没有意义”的情况。
-// 当前只处理像 account_deactivated、token_invalidated、token_revoked 这类明确不会自行恢复的情况。
-func permanentDisableReasonFromMessage(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return ""
-	}
-
-	type providerErrorBody struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
-	}
-	type providerErrorEnvelope struct {
-		Code    string            `json:"code"`
-		Message string            `json:"message"`
-		Error   providerErrorBody `json:"error"`
-	}
-
-	// 先尽量按标准 JSON 错误结构解析。
-	// 大多数上游返回都能走到这里，也是后续最推荐扩展新条件的位置。
-	var parsed providerErrorEnvelope
-	if json.Valid([]byte(raw)) && json.Unmarshal([]byte(raw), &parsed) == nil {
-		// 第一层优先看 error.code。
-		// 因为这里最稳定，不容易受 message 文案变化影响。
-		if strings.EqualFold(strings.TrimSpace(parsed.Error.Code), "account_deactivated") {
-			return raw
-		}
-		if strings.EqualFold(strings.TrimSpace(parsed.Error.Code), "token_invalidated") {
-			return raw
-		}
-		if strings.EqualFold(strings.TrimSpace(parsed.Error.Code), "token_revoked") {
-			return raw
-		}
-		// 第二层兼容外层 code。
-		// 有些上游不会把 code 放进 error 对象里，所以这里也顺手兼容。
-		if strings.EqualFold(strings.TrimSpace(parsed.Code), "account_deactivated") {
-			return raw
-		}
-		if strings.EqualFold(strings.TrimSpace(parsed.Code), "token_invalidated") {
-			return raw
-		}
-		if strings.EqualFold(strings.TrimSpace(parsed.Code), "token_revoked") {
-			return raw
-		}
-	}
-
-	lower := strings.ToLower(raw)
-	// 如果没法按 JSON 正常识别，就退回到字符串关键字匹配。
-	// 这是兜底逻辑，目的是避免因为返回格式轻微变化而漏掉明显的永久失效错误。
-	if strings.Contains(lower, "account_deactivated") ||
-		strings.Contains(lower, "has been deactivated") ||
-		strings.Contains(lower, "token_invalidated") ||
-		strings.Contains(lower, "authentication token has been invalidated") ||
-		strings.Contains(lower, "token_revoked") ||
-		strings.Contains(lower, "invalidated oauth token") {
-		return raw
-	}
-	return ""
 }
 
 // disableAuthForPermanentFailure 负责把一个已经确认永久失效的 auth
