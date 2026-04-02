@@ -60,6 +60,8 @@ type Auth struct {
 	Label string `json:"label,omitempty"`
 	// Status is the lifecycle status managed by the AuthManager.
 	Status Status `json:"status"`
+	// DBStatus 对应数据库 cli_oauth.status，用来区分正常、失活、额度不足三种状态。
+	DBStatus int `json:"-"`
 	// StatusMessage holds a short description for the current status.
 	StatusMessage string `json:"status_message,omitempty"`
 	// Disabled indicates the auth is intentionally disabled by operator.

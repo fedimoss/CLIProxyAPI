@@ -366,6 +366,16 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth == nil {
 		return true, blockReasonOther, time.Time{}
 	}
+	// 数据库状态优先级高于运行时临时状态：
+	// 2 代表账号失活，3 代表额度不足，这两种都不应继续参与选号。
+	switch DBStatusForAuth(auth) {
+	case DBStatusDisabled:
+		// 状态 2 直接视为不可用，不再参与任何模型选择。
+		return true, blockReasonDisabled, time.Time{}
+	case DBStatusQuotaLimited:
+		// 状态 3 也不参与选号，但它和状态 2 的区别在于后面还会继续被定时复检。
+		return true, blockReasonOther, time.Time{}
+	}
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}

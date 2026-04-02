@@ -63,8 +63,18 @@ const (
 	refreshMaxConcurrency = 16
 	refreshPendingBackoff = time.Minute
 	refreshFailureBackoff = 5 * time.Minute
+	healthProbeTimeout    = 15 * time.Second
+	healthProbeMaxGap     = 2 * time.Minute
+	healthProbeMaxWorkers = 8
 	quotaBackoffBase      = time.Second
 	quotaBackoffMax       = 30 * time.Minute
+
+	// 周额度剩余比例低于这个阈值时，测活会把账号标记为额度不足。
+	healthProbeMinimumRemainingWeeklyPercent = 90
+	// 本地健康复检沿用 codex CLI 的 User-Agent，尽量贴近真实请求环境。
+	codexHealthProbeUserAgent = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
+	// 健康复检改写账号状态后，单独给落库预留一个较短超时，避免被探测请求的超时连带取消。
+	healthProbePersistTimeout = 5 * time.Second
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -163,6 +173,10 @@ type Manager struct {
 	// Auto refresh state
 	refreshCancel    context.CancelFunc
 	refreshSemaphore chan struct{}
+	// 本地健康复检状态
+	healthSemaphore chan struct{} // 限制本地健康复检的全局并发数（最多 healthProbeMaxWorkers 个同时进行）
+	healthProbeAt   sync.Map      // 记录每个 auth 上一次复检时间，用于最小间隔控制（key: authID, value: time.Time）
+	healthProbeBusy sync.Map      // 标记正在被复检的 auth，防止同一个 auth 同时跑多个探测（key: authID, value: struct{}）
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -182,6 +196,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		providerOffsets:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
 		refreshSemaphore: make(chan struct{}, refreshMaxConcurrency),
+		healthSemaphore:  make(chan struct{}, healthProbeMaxWorkers),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
@@ -585,7 +600,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 				if se, ok := errors.AsType[cliproxyexecutor.StatusError](chunk.Err); ok && se != nil {
 					rerr.HTTPStatus = se.StatusCode()
 				}
-				m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr})
+				m.MarkResultLocal(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr})
 			}
 			if !forward {
 				return false
@@ -615,7 +630,7 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 			}
 		}
 		if !failed {
-			m.MarkResult(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true})
+			m.MarkResultLocal(ctx, Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: true})
 		}
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
@@ -641,7 +656,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
-			m.MarkResult(ctx, result)
+			m.MarkResultLocal(ctx, result)
 			if isRequestInvalidError(errStream) {
 				return nil, errStream
 			}
@@ -662,7 +677,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				}
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
-				m.MarkResult(ctx, result)
+				m.MarkResultLocal(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
 				return nil, bootstrapErr
 			}
@@ -673,7 +688,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				}
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
-				m.MarkResult(ctx, result)
+				m.MarkResultLocal(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
 				lastErr = bootstrapErr
 				continue
@@ -684,7 +699,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(bootstrapErr)
-			m.MarkResult(ctx, result)
+			m.MarkResultLocal(ctx, result)
 			discardStreamChunks(streamResult.Chunks)
 			return nil, newStreamBootstrapError(bootstrapErr, streamResult.Headers)
 		}
@@ -692,7 +707,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		if closed && len(buffered) == 0 {
 			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr}
-			m.MarkResult(ctx, result)
+			m.MarkResultLocal(ctx, result)
 			if idx < len(execModels)-1 {
 				lastErr = emptyErr
 				continue
@@ -1123,14 +1138,14 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
-				m.MarkResult(execCtx, result)
+				m.MarkResultLocal(execCtx, result)
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
 				continue
 			}
-			m.MarkResult(execCtx, result)
+			m.MarkResultLocal(execCtx, result)
 			return resp, nil
 		}
 		if authErr != nil {
@@ -1201,14 +1216,14 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				if ra := retryAfterFromError(errExec); ra != nil {
 					result.RetryAfter = ra
 				}
-				m.MarkResult(execCtx, result)
+				m.MarkResultLocal(execCtx, result)
 				if isRequestInvalidError(errExec) {
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
 				continue
 			}
-			m.MarkResult(execCtx, result)
+			m.MarkResultLocal(execCtx, result)
 			return resp, nil
 		}
 		if authErr != nil {
@@ -1853,6 +1868,806 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 
 	m.hook.OnResult(ctx, result)
+}
+
+// MarkResultLocal 复用原有结果处理逻辑，并在本地版流程中为成功的 OAuth
+// 请求补上一条后台健康复检链路。
+func (m *Manager) MarkResultLocal(ctx context.Context, result Result) {
+	m.MarkResult(ctx, result)
+	if m == nil || !result.Success {
+		return
+	}
+	// 只有主请求已经成功时，才在后台补做一次“额度/健康”复检。
+	// 这样不会拖慢当前响应，但能尽快把已经失效的 OAuth 清出可用池。
+	m.scheduleAuthHealthProbeLocal(result.AuthID)
+}
+
+type authHealthProbeSpecLocal struct {
+	Method  string
+	URL     string
+	Headers http.Header
+}
+
+type authHealthProbeFailureLocal struct {
+	Reason       string
+	QuotaLimited bool
+}
+
+// authHealthProbeDecisionLocal 表示一次测活后的最终落库结果。
+// DBStatus 会直接影响账号是否继续轮询、是否继续参与后续定时复检。
+type authHealthProbeDecisionLocal struct {
+	DBStatus   int
+	HTTPStatus int
+	Reason     string
+}
+
+// scheduleAuthHealthProbeLocal 异步触发单个 auth 的本地健康复检。
+// 这里故意不阻塞当前请求，让复检结果只影响后续请求。
+func (m *Manager) scheduleAuthHealthProbeLocal(authID string) {
+	authID = strings.TrimSpace(authID)
+	if m == nil || authID == "" {
+		return
+	}
+	go m.runAuthHealthProbeWithLimitLocal(context.Background(), authID)
+}
+
+// checkAuthHealthProbesLocal 用于定时巡检仍可被复检的 OAuth 账号（DBStatus 为 1 或 3）。
+// 它和”成功后异步复检”共用同一套底层探测逻辑，只是触发时机不同。
+func (m *Manager) checkAuthHealthProbesLocal(ctx context.Context) {
+	if m == nil {
+		return
+	}
+	for _, auth := range m.snapshotAuths() {
+		if !supportsAuthHealthProbeLocal(auth) {
+			continue
+		}
+		go m.runAuthHealthProbeWithLimitLocal(ctx, auth.ID)
+	}
+}
+
+// runAuthHealthProbeWithLimitLocal 负责给本地健康复检加两层保护：
+// 1. 同一个 auth 同一时间只允许跑一个复检；
+// 2. 全局并发数受限，避免一次性打太多探测请求。
+func (m *Manager) runAuthHealthProbeWithLimitLocal(ctx context.Context, authID string) {
+	authID = strings.TrimSpace(authID)
+	if m == nil || authID == "" {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	auth, ok := m.beginAuthHealthProbeLocal(authID, time.Now())
+	if !ok || auth == nil {
+		return
+	}
+	defer m.endAuthHealthProbeLocal(authID)
+
+	if m.healthSemaphore == nil {
+		m.runAuthHealthProbeLocal(ctx, auth)
+		return
+	}
+	select {
+	case m.healthSemaphore <- struct{}{}:
+		defer func() { <-m.healthSemaphore }()
+	case <-ctx.Done():
+		return
+	}
+	m.runAuthHealthProbeLocal(ctx, auth)
+}
+
+// beginAuthHealthProbeLocal 判断这次复检是否允许开始。
+// 这里会做最小间隔控制，避免同一个 auth 在短时间内被反复探测。
+func (m *Manager) beginAuthHealthProbeLocal(authID string, now time.Time) (*Auth, bool) {
+	if m == nil {
+		return nil, false
+	}
+	if lastRun, ok := m.healthProbeAt.Load(authID); ok {
+		if ts, okTime := lastRun.(time.Time); okTime && now.Sub(ts) < healthProbeMaxGap {
+			return nil, false
+		}
+	}
+	if _, loaded := m.healthProbeBusy.LoadOrStore(authID, struct{}{}); loaded {
+		return nil, false
+	}
+	auth, ok := m.GetByID(authID)
+	if !ok || !supportsAuthHealthProbeLocal(auth) {
+		m.healthProbeBusy.Delete(authID)
+		return nil, false
+	}
+	m.healthProbeAt.Store(authID, now)
+	return auth, true
+}
+
+// endAuthHealthProbeLocal 在复检结束后释放“正在复检”的占位标记。
+func (m *Manager) endAuthHealthProbeLocal(authID string) {
+	if m == nil {
+		return
+	}
+	m.healthProbeBusy.Delete(strings.TrimSpace(authID))
+}
+
+// runAuthHealthProbeLocal 真正执行一次健康复检。
+// 探测结果通过 classifyAuthHealthProbeLocal 分类为三态：
+// 正常（DBStatus=1）、额度不足（DBStatus=3）、账号失活（DBStatus=2），
+// 再通过 applyAuthHealthProbeDecisionLocal 写回 auth 并落库。
+func (m *Manager) runAuthHealthProbeLocal(parent context.Context, auth *Auth) {
+	if m == nil || auth == nil {
+		return
+	}
+	ctx := parent
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, healthProbeTimeout)
+	defer cancel()
+
+	statusCode, body, errProbe := m.executeAuthHealthProbeLocal(ctx, auth)
+	if errProbe != nil {
+		log.WithError(errProbe).Debugf("auth health probe failed for %s (%s)", auth.Provider, auth.ID)
+		m.applyAuthHealthProbeDecisionLocal(ctx, auth.ID, authHealthProbeDecisionLocal{
+			DBStatus:   DBStatusDisabled,
+			HTTPStatus: 0,
+			Reason:     strings.TrimSpace(errProbe.Error()),
+		})
+		return
+	}
+	decision := classifyAuthHealthProbeLocal(statusCode, body)
+	m.applyAuthHealthProbeDecisionLocal(ctx, auth.ID, decision)
+}
+
+// classifyAuthHealthProbeLocal 根据测活响应的 HTTP 状态码和内容，分类为三种落库结果：
+// 正常（DBStatus=1）、额度不足（DBStatus=3）、账号失活（DBStatus=2）。
+func classifyAuthHealthProbeLocal(httpStatus int, body string) authHealthProbeDecisionLocal {
+	// 判断顺序和外部脚本保持一致：
+	// 先看返回体里的 status_code，再看失败信号，最后区分失活还是额度不足。
+	httpStatus = normalizeAuthHealthProbeStatusCodeLocal(httpStatus, body)
+	failure := extractCliproxyFailureReasonLocal(body, healthProbeMinimumRemainingWeeklyPercent)
+	if httpStatus >= http.StatusBadRequest {
+		// 只要 status_code >= 400，就先把这次测活视为失败；
+		// 然后再根据 failure 是否属于额度类问题，把结果落到 2 或 3。
+		reason := "HTTP " + strconv.Itoa(httpStatus)
+		if failure != nil && strings.TrimSpace(failure.Reason) != "" {
+			// 如果返回体里已经带了更具体的失败原因，优先展示它，不保留笼统的 HTTP 文案。
+			reason = strings.TrimSpace(failure.Reason)
+		}
+		if failure != nil && failure.QuotaLimited {
+			return authHealthProbeDecisionLocal{
+				DBStatus:   DBStatusQuotaLimited,
+				HTTPStatus: normalizeQuotaHealthProbeStatusCodeLocal(httpStatus),
+				Reason:     reason,
+			}
+		}
+		return authHealthProbeDecisionLocal{
+			DBStatus:   DBStatusDisabled,
+			HTTPStatus: httpStatus,
+			Reason:     reason,
+		}
+	}
+	if failure != nil && strings.TrimSpace(failure.Reason) != "" {
+		// status_code 本身正常时，再看内容里有没有坏信号或额度不足信号。
+		status := DBStatusDisabled
+		httpStatusForReason := httpStatus
+		if failure.QuotaLimited {
+			// 额度问题不打成死号，而是落到状态 3，等待后续定时复检恢复。
+			status = DBStatusQuotaLimited
+			httpStatusForReason = normalizeQuotaHealthProbeStatusCodeLocal(httpStatusForReason)
+		}
+		return authHealthProbeDecisionLocal{
+			DBStatus:   status,
+			HTTPStatus: httpStatusForReason,
+			Reason:     strings.TrimSpace(failure.Reason),
+		}
+	}
+	return authHealthProbeDecisionLocal{
+		DBStatus:   DBStatusActive,
+		HTTPStatus: httpStatus,
+	}
+}
+
+// normalizeAuthHealthProbeStatusCodeLocal 优先取响应体内的 status_code，回退到 HTTP 状态码。
+func normalizeAuthHealthProbeStatusCodeLocal(httpStatus int, body string) int {
+	// 如果响应体里已经带了 status_code，就以它为准；
+	// 这和外部脚本的判断方式保持一致。
+	decoded := decodePossibleJSONPayloadLocal(body)
+	if data, ok := decoded.(map[string]any); ok {
+		if statusCode, okStatus := intValueFromAnyLocal(data["status_code"]); okStatus && statusCode > 0 {
+			// 这里优先使用响应体里的 status_code，避免被外层 200 掩盖真实失败。
+			return statusCode
+		}
+	}
+	if httpStatus > 0 {
+		// 只有响应体没带 status_code 时，才回退到 HTTP 层状态码。
+		return httpStatus
+	}
+	return http.StatusOK
+}
+
+// normalizeQuotaHealthProbeStatusCodeLocal 额度不足时把 0 或 200 统一归一成 429，便于后续展示和排查。
+func normalizeQuotaHealthProbeStatusCodeLocal(status int) int {
+	// 额度不足统一归一成 429，便于后续展示和排查。
+	if status == 0 || status == http.StatusOK {
+		return http.StatusTooManyRequests
+	}
+	return status
+}
+
+func detachedPersistContextLocal(ctx context.Context) (context.Context, context.CancelFunc) {
+	// 测活请求本身带有 15 秒超时。
+	// 如果把同一个 ctx 继续传给落库，前面的 HTTP 探测一旦接近超时，
+	// 后面的 SELECT/UPDATE 还没开始就可能直接拿到 context deadline exceeded。
+	persistCtx, cancel := context.WithTimeout(context.Background(), healthProbePersistTimeout)
+	if shouldSkipPersist(ctx) {
+		persistCtx = WithSkipPersist(persistCtx)
+	}
+	return persistCtx, cancel
+}
+
+func (m *Manager) applyAuthHealthProbeDecisionLocal(ctx context.Context, authID string, decision authHealthProbeDecisionLocal) {
+	authID = strings.TrimSpace(authID)
+	if m == nil || authID == "" {
+		return
+	}
+	now := time.Now()
+	var (
+		authSnapshot            *Auth
+		shouldUnregisterClient  bool
+		shouldNotifyAuthUpdated bool
+	)
+
+	m.mu.Lock()
+	auth, ok := m.auths[authID]
+	if ok && auth != nil {
+		prevDBStatus := DBStatusForAuth(auth)
+		nextDBStatus := NormalizeDBStatus(decision.DBStatus)
+		// 先把最新测活结论写回 auth，后面的持久化和调度都以它为准。
+		auth.DBStatus = nextDBStatus
+		auth.UpdatedAt = now
+		switch nextDBStatus {
+		case DBStatusActive:
+			// 只有从状态 3 恢复到状态 1 时，才清理额度不足留下的运行时痕迹。
+			if prevDBStatus == DBStatusQuotaLimited {
+				auth.Disabled = false
+				auth.Status = StatusActive
+				auth.Unavailable = false
+				auth.StatusMessage = ""
+				auth.LastError = nil
+				auth.Quota = QuotaState{}
+				auth.NextRetryAfter = time.Time{}
+			}
+		case DBStatusQuotaLimited:
+			// 状态 3 表示账号还活着，但额度不足，不能继续参与请求轮询。
+			auth.Disabled = false
+			auth.Status = StatusError
+			auth.Unavailable = true
+			// 这里保留原始原因，方便后续排查到底是“额度耗尽”还是“剩余低于 20%”。
+			auth.StatusMessage = strings.TrimSpace(decision.Reason)
+			auth.LastError = &Error{
+				Code:       "quota_limited",
+				Message:    strings.TrimSpace(decision.Reason),
+				HTTPStatus: normalizeQuotaHealthProbeStatusCodeLocal(decision.HTTPStatus),
+			}
+			auth.Quota = QuotaState{
+				Exceeded: true,
+				Reason:   "quota",
+			}
+			// 状态 3 不依赖冷却时间恢复，而是依赖下一轮定时复检重新判断。
+			auth.NextRetryAfter = time.Time{}
+		case DBStatusDisabled:
+			// 状态 2 表示账号失活，后续不再自动复检。
+			auth.Disabled = true
+			auth.Unavailable = false
+			auth.Status = StatusDisabled
+			auth.StatusMessage = healthProbeFailureReasonLocal(decision.HTTPStatus, decision.Reason)
+			auth.LastError = &Error{
+				Code:       "account_deactivated",
+				Message:    healthProbeFailureReasonLocal(decision.HTTPStatus, decision.Reason),
+				HTTPStatus: decision.HTTPStatus,
+			}
+			auth.Quota = QuotaState{}
+			auth.NextRetryAfter = time.Time{}
+			// 状态 2 需要立刻从注册表中移除，避免后续请求继续命中这条账号。
+			shouldUnregisterClient = true
+		}
+		// 每次测活后的最新分类都立刻写库，确保重启后仍按同一结果运行。
+		// 这里故意不用测活请求自己的 ctx，避免上游探测快超时时把数据库写入一起带死。
+		persistCtx, cancelPersist := detachedPersistContextLocal(ctx)
+		_ = m.persist(persistCtx, auth)
+		cancelPersist()
+		authSnapshot = auth.Clone()
+		shouldNotifyAuthUpdated = true
+	}
+	m.mu.Unlock()
+
+	if shouldUnregisterClient {
+		registry.GetGlobalRegistry().UnregisterClient(authID)
+	}
+	if m.scheduler != nil && authSnapshot != nil {
+		m.scheduler.upsertAuth(authSnapshot)
+	}
+	if shouldNotifyAuthUpdated && authSnapshot != nil {
+		m.hook.OnAuthUpdated(ctx, authSnapshot)
+	}
+}
+
+// executeAuthHealthProbeLocal 发起一次实际的健康探测请求。
+// 这里复用当前 auth 自己的 HttpRequest 能力，保证探测时使用的
+// 凭证、代理、请求头和主请求尽量一致。
+// 具体“探测哪个地址、用什么方法”由提供方适配层决定，
+// 这样后面新增其他提供方时，只需要补自己的 spec 生成逻辑。
+func (m *Manager) executeAuthHealthProbeLocal(ctx context.Context, auth *Auth) (int, string, error) {
+	if m == nil || auth == nil {
+		return 0, "", &Error{Code: "auth_not_found", Message: "auth is nil"}
+	}
+	spec, ok := authHealthProbeSpecForAuthLocal(auth)
+	if !ok || spec == nil {
+		return 0, "", &Error{Code: "not_supported", Message: "auth health probe is not supported"}
+	}
+	method := strings.TrimSpace(spec.Method)
+	if method == "" {
+		method = http.MethodGet
+	}
+	req, errReq := http.NewRequestWithContext(ctx, method, spec.URL, nil)
+	if errReq != nil {
+		return 0, "", errReq
+	}
+	if spec.Headers != nil {
+		req.Header = spec.Headers.Clone()
+	}
+	if strings.TrimSpace(req.Header.Get("Accept")) == "" {
+		req.Header.Set("Accept", "application/json")
+	}
+	resp, errDo := m.HttpRequest(ctx, auth, req)
+	if errDo != nil {
+		return 0, "", errDo
+	}
+	if resp == nil {
+		return 0, "", &Error{Code: "probe_failed", Message: "health probe returned nil response"}
+	}
+	defer func() {
+		if resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	body, errRead := io.ReadAll(resp.Body)
+	if errRead != nil {
+		return 0, "", errRead
+	}
+	return resp.StatusCode, strings.TrimSpace(string(body)), nil
+}
+
+// supportsAuthHealthProbeLocal 决定某个 auth 当前是否支持本地健康复检。
+// 主流程只依赖这个统一入口，不关心具体是哪个提供方。
+func supportsAuthHealthProbeLocal(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	// 只复检状态 1 和 3；
+	// 状态 2 已经是失活账号，不再继续探测。
+	switch DBStatusForAuth(auth) {
+	case DBStatusDisabled:
+		return false
+	}
+	if isAPIKeyAuth(auth) {
+		// 这里的测活规则只针对 OAuth 账号，API key 不走这条 wham/usage 复检链路。
+		return false
+	}
+	_, ok := authHealthProbeSpecForAuthLocal(auth)
+	return ok
+}
+
+// authHealthProbeSpecForAuthLocal 是多提供方扩展点。
+// 当前框架已经支持按 provider 分流，但第一版只挂接了 codex。
+// 后面要新增其他提供方时，在这里补一个分支即可。
+func authHealthProbeSpecForAuthLocal(auth *Auth) (*authHealthProbeSpecLocal, bool) {
+	if auth == nil {
+		return nil, false
+	}
+	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
+	case "codex":
+		return codexAuthHealthProbeSpecLocal(auth)
+	default:
+		return nil, false
+	}
+}
+
+// codexAuthHealthProbeSpecLocal 生成 codex 提供方使用的本地健康复检 spec。
+// 这里先把 codex 的探测规则独立出来，后续新增其它 provider 时可以照这个结构继续补。
+func codexAuthHealthProbeSpecLocal(auth *Auth) (*authHealthProbeSpecLocal, bool) {
+	if auth == nil {
+		return nil, false
+	}
+	baseURL := ""
+	if auth.Attributes != nil {
+		baseURL = strings.TrimSpace(auth.Attributes["base_url"])
+	}
+	if baseURL == "" {
+		baseURL = "https://chatgpt.com/backend-api/codex"
+	}
+	baseURL = strings.TrimRight(baseURL, "/")
+	if strings.HasSuffix(strings.ToLower(baseURL), "/codex") {
+		baseURL = baseURL[:len(baseURL)-len("/codex")]
+	}
+	if baseURL == "" {
+		return nil, false
+	}
+	headers := http.Header{
+		"Accept":     {"application/json"},
+		"User-Agent": {codexHealthProbeUserAgent},
+	}
+	// 尽量把账号标识一起带上，确保测活打到的就是这条账号自己的上下文。
+	if auth.Metadata != nil {
+		if accountID, ok := auth.Metadata["account_id"].(string); ok {
+			if trimmed := strings.TrimSpace(accountID); trimmed != "" {
+				// 优先使用登录时拿到的 account_id，保证测活命中的就是这条账号自己的 usage。
+				headers.Set("Chatgpt-Account-Id", trimmed)
+			}
+		}
+	}
+	if len(headers.Values("Chatgpt-Account-Id")) == 0 && auth.Attributes != nil {
+		if accountID := strings.TrimSpace(auth.Attributes["account_id"]); accountID != "" {
+			// 某些来源可能把 account_id 放在 Attributes，这里做一次兜底。
+			headers.Set("Chatgpt-Account-Id", accountID)
+		}
+	}
+	return &authHealthProbeSpecLocal{
+		Method:  http.MethodGet,
+		URL:     baseURL + "/wham/usage",
+		Headers: headers,
+	}, true
+}
+
+// decodePossibleJSONPayloadLocal 尝试把可能是 JSON 字符串的 payload 拆解成结构化对象。
+// 有些字段本身是字符串但里面又包了一层 JSON，统一拆开后，后续递归提取失败信号
+// 就可以按同一套结构处理。
+func decodePossibleJSONPayloadLocal(payload any) any {
+	switch typed := payload.(type) {
+	case nil:
+		return nil
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return ""
+		}
+		var decoded any
+		if json.Valid([]byte(trimmed)) && json.Unmarshal([]byte(trimmed), &decoded) == nil {
+			// 能成功拆成 JSON 时，后面就可以继续递归往里挖失败信号。
+			return decoded
+		}
+		return trimmed
+	case []byte:
+		return decodePossibleJSONPayloadLocal(string(typed))
+	default:
+		return payload
+	}
+}
+
+// extractCliproxyFailureReasonLocal 从测活响应中递归提取失败原因。
+// 提取顺序与外部脚本保持一致：error -> rate_limit/code_review_rate_limit -> additional_rate_limits -> 嵌套字段 -> 关键词兜底。
+func extractCliproxyFailureReasonLocal(payload any, minRemainingWeeklyPercent int) *authHealthProbeFailureLocal {
+	// 按外部脚本的顺序提取失败原因：
+	// error -> rate_limit/code_review_rate_limit -> additional_rate_limits -> 嵌套字段 -> 关键词兜底。
+	data := decodePossibleJSONPayloadLocal(payload)
+	switch typed := data.(type) {
+	case string:
+		keyword, ok := knownCliproxyKeywordLocal(typed)
+		if !ok {
+			return nil
+		}
+		// 纯字符串场景直接按关键词匹配，和外部脚本保持一致。
+		return &authHealthProbeFailureLocal{
+			Reason:       formatKnownCliproxyErrorLocal(keyword),
+			QuotaLimited: isCliproxyQuotaKeywordLocal(keyword),
+		}
+	case map[string]any:
+		errorValue, _ := typed["error"].(map[string]any)
+		if errorValue != nil {
+			if errType, okType := stringValueFromAnyLocal(errorValue["type"]); okType && strings.TrimSpace(errType) != "" {
+				// error.type 是最强信号，命中后直接返回，不再继续往下找。
+				return &authHealthProbeFailureLocal{
+					Reason:       formatKnownCliproxyErrorLocal(strings.TrimSpace(errType)),
+					QuotaLimited: isCliproxyQuotaKeywordLocal(strings.TrimSpace(errType)),
+				}
+			}
+			if errMessage, okMessage := stringValueFromAnyLocal(errorValue["message"]); okMessage && strings.TrimSpace(errMessage) != "" {
+				keyword, foundKeyword := knownCliproxyKeywordLocal(errMessage)
+				// error.message 没有结构化类型时，至少把原文保留下来，方便后续定位。
+				return &authHealthProbeFailureLocal{
+					Reason:       strings.TrimSpace(errMessage),
+					QuotaLimited: foundKeyword && isCliproxyQuotaKeywordLocal(keyword),
+				}
+			}
+		}
+
+		for _, key := range []string{"rate_limit", "code_review_rate_limit"} {
+			minRemaining := 0
+			if key == "rate_limit" {
+				minRemaining = minRemainingWeeklyPercent
+			}
+			if failure := extractRateLimitReasonLocal(typed[key], key, minRemaining); failure != nil {
+				return failure
+			}
+		}
+
+		switch additional := typed["additional_rate_limits"].(type) {
+		case []any:
+			for idx, rateInfo := range additional {
+				key := "additional_rate_limits[" + strconv.Itoa(idx) + "]"
+				// 额外限额也是失效信号的一部分，逐项递归检查。
+				if failure := extractRateLimitReasonLocal(rateInfo, key, 0); failure != nil {
+					return failure
+				}
+			}
+		case map[string]any:
+			for key, rateInfo := range additional {
+				// 有些返回是对象形式，这里也要一并覆盖掉。
+				if failure := extractRateLimitReasonLocal(rateInfo, "additional_rate_limits."+key, 0); failure != nil {
+					return failure
+				}
+			}
+		}
+
+		for _, key := range []string{"data", "body", "response", "text", "content", "status_message"} {
+			if failure := extractCliproxyFailureReasonLocal(typed[key], minRemainingWeeklyPercent); failure != nil {
+				// 失败信息可能藏在嵌套字段里，这里递归挖出来。
+				return failure
+			}
+		}
+
+		if encoded, errMarshal := json.Marshal(typed); errMarshal == nil {
+			if keyword, okKeyword := knownCliproxyKeywordLocal(string(encoded)); okKeyword {
+				// 前面都没命中时，再做一次全文关键词兜底。
+				return &authHealthProbeFailureLocal{
+					Reason:       formatKnownCliproxyErrorLocal(keyword),
+					QuotaLimited: isCliproxyQuotaKeywordLocal(keyword),
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// extractRateLimitReasonLocal 从 rate_limit 对象中提取额度不足的具体原因。
+func extractRateLimitReasonLocal(rateInfo any, key string, minRemainingWeeklyPercent int) *authHealthProbeFailureLocal {
+	// 额度不足的判断分两类：
+	// 1. allowed=false 或 limit_reached=true
+	// 2. 周额度剩余比例低于阈值（这里固定为 20%）
+	data, ok := decodePossibleJSONPayloadLocal(rateInfo).(map[string]any)
+	if !ok {
+		return nil
+	}
+	allowed, hasAllowed := boolValueFromAnyLocal(data["allowed"])
+	limitReached, hasLimitReached := boolValueFromAnyLocal(data["limit_reached"])
+	if (hasAllowed && !allowed) || (hasLimitReached && limitReached) {
+		// 一旦明确提示不允许继续用，直接视为额度不足，不再往下看百分比。
+		label := key + " exhausted"
+		switch key {
+		case "rate_limit":
+			label = "weekly quota exhausted"
+		case "code_review_rate_limit":
+			label = "code review weekly quota exhausted"
+		}
+		reason := label + " (allowed="
+		if hasAllowed {
+			reason += strconv.FormatBool(allowed)
+		} else {
+			reason += "unknown"
+		}
+		reason += ", limit_reached="
+		if hasLimitReached {
+			reason += strconv.FormatBool(limitReached)
+		} else {
+			reason += "unknown"
+		}
+		reason += ")"
+		return &authHealthProbeFailureLocal{
+			Reason:       reason,
+			QuotaLimited: true,
+		}
+	}
+	if key == "rate_limit" && minRemainingWeeklyPercent > 0 {
+		if remainingPercent, okRemaining := extractRemainingPercentLocal(data["primary_window"]); okRemaining && remainingPercent < float64(minRemainingWeeklyPercent) {
+			// 这里实现你的自定义规则：低于 20% 就进入状态 3。
+			return &authHealthProbeFailureLocal{
+				Reason:       "weekly quota remaining " + formatPercentLocal(remainingPercent) + "% is below " + strconv.Itoa(minRemainingWeeklyPercent) + "%",
+				QuotaLimited: true,
+			}
+		}
+	}
+	return nil
+}
+
+// extractRemainingPercentLocal 从 primary_window 中提取剩余额度百分比，兼容 remaining_percent 和 used_percent 两种格式。
+func extractRemainingPercentLocal(payload any) (float64, bool) {
+	// 同时兼容 remaining_percent 和 used_percent 两种格式。
+	data, ok := decodePossibleJSONPayloadLocal(payload).(map[string]any)
+	if !ok {
+		return 0, false
+	}
+	if remainingPercent, okRemaining := floatValueFromAnyLocal(data["remaining_percent"]); okRemaining {
+		// 直接给了 remaining_percent 时，优先使用它。
+		return clampPercentLocal(remainingPercent), true
+	}
+	if usedPercent, okUsed := floatValueFromAnyLocal(data["used_percent"]); okUsed {
+		// 只给 used_percent 时，换算成剩余百分比再参与判断。
+		return clampPercentLocal(100 - usedPercent), true
+	}
+	return 0, false
+}
+
+// clampPercentLocal 把百分比值限制在 0-100 范围内。
+func clampPercentLocal(value float64) float64 {
+	if value < 0 {
+		return 0
+	}
+	if value > 100 {
+		return 100
+	}
+	return value
+}
+
+// formatPercentLocal 格式化百分比为可读字符串，去掉尾部多余的 0。
+func formatPercentLocal(value float64) string {
+	rounded := strconv.FormatFloat(value, 'f', 2, 64)
+	rounded = strings.TrimRight(strings.TrimRight(rounded, "0"), ".")
+	if rounded == "" {
+		return "0"
+	}
+	return rounded
+}
+
+// knownCliproxyKeywordLocal 检查字符串是否包含已知的失败关键词（如 usage_limit_reached、account_deactivated 等）。
+func knownCliproxyKeywordLocal(value string) (string, bool) {
+	value = strings.ToLower(value)
+	for _, keyword := range []string{"usage_limit_reached", "account_deactivated", "insufficient_quota", "invalid_api_key", "unsupported_region"} {
+		if strings.Contains(value, keyword) {
+			return keyword, true
+		}
+	}
+	return "", false
+}
+
+// isCliproxyQuotaKeywordLocal 判断关键词是否属于额度类问题（usage_limit_reached、insufficient_quota）。
+func isCliproxyQuotaKeywordLocal(keyword string) bool {
+	switch strings.TrimSpace(keyword) {
+	case "usage_limit_reached", "insufficient_quota":
+		return true
+	default:
+		return false
+	}
+}
+
+// formatKnownCliproxyErrorLocal 把已知错误关键词格式化为可读的错误描述，便于写库和排查。
+func formatKnownCliproxyErrorLocal(keyword string) string {
+	// 给常见错误类型补充更好读的说明，便于写库和排查。
+	switch strings.TrimSpace(keyword) {
+	case "usage_limit_reached":
+		return "quota exhausted (usage_limit_reached)"
+	case "account_deactivated":
+		return "account deactivated (account_deactivated)"
+	case "insufficient_quota":
+		return "insufficient quota (insufficient_quota)"
+	case "invalid_api_key":
+		return "invalid API key (invalid_api_key)"
+	case "unsupported_region":
+		return "unsupported region (unsupported_region)"
+	default:
+		return "error type: " + strings.TrimSpace(keyword)
+	}
+}
+
+// stringValueFromAnyLocal 从任意类型值中提取字符串（支持 string、json.Number）。
+func stringValueFromAnyLocal(value any) (string, bool) {
+	switch typed := value.(type) {
+	case string:
+		return typed, true
+	case json.Number:
+		return typed.String(), true
+	}
+	return "", false
+}
+
+// boolValueFromAnyLocal 从任意类型值中提取布尔值（支持 bool、string、json.Number、float64）。
+func boolValueFromAnyLocal(value any) (bool, bool) {
+	switch typed := value.(type) {
+	case bool:
+		return typed, true
+	case string:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(typed))
+		if err == nil {
+			return parsed, true
+		}
+	case json.Number:
+		parsed, err := typed.Int64()
+		if err == nil {
+			return parsed != 0, true
+		}
+	case float64:
+		return typed != 0, true
+	}
+	return false, false
+}
+
+// floatValueFromAnyLocal 从任意类型值中提取浮点数（支持 float32/64、int、int64、json.Number、string）。
+func floatValueFromAnyLocal(value any) (float64, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return typed, true
+	case float32:
+		return float64(typed), true
+	case int:
+		return float64(typed), true
+	case int64:
+		return float64(typed), true
+	case json.Number:
+		parsed, err := typed.Float64()
+		if err == nil {
+			return parsed, true
+		}
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(typed), 64)
+		if err == nil {
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
+// intValueFromAnyLocal 从任意类型值中提取整数（支持 int、int32、int64、float64、json.Number、string）。
+func intValueFromAnyLocal(value any) (int, bool) {
+	switch typed := value.(type) {
+	case int:
+		return typed, true
+	case int32:
+		return int(typed), true
+	case int64:
+		return int(typed), true
+	case float64:
+		return int(typed), true
+	case json.Number:
+		parsed, err := typed.Int64()
+		if err == nil {
+			return int(parsed), true
+		}
+	case string:
+		parsed, err := strconv.Atoi(strings.TrimSpace(typed))
+		if err == nil {
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
+// healthProbeFailureReasonLocal 把测活失败的原因格式化为 JSON 字符串，供落库和展示。
+// 如果响应体已经是合法 JSON 则原样返回；否则用 status+detail+message 包一层 JSON 结构。
+func healthProbeFailureReasonLocal(status int, body string) string {
+	body = strings.TrimSpace(body)
+	if body != "" && json.Valid([]byte(body)) {
+		return body
+	}
+	if status <= 0 {
+		status = http.StatusServiceUnavailable
+	}
+	reason := struct {
+		Status  int    `json:"status"`
+		Detail  string `json:"detail,omitempty"`
+		Message string `json:"message,omitempty"`
+	}{
+		Status: status,
+		Detail: http.StatusText(status),
+	}
+	if body != "" {
+		reason.Message = body
+	}
+	encoded, errMarshal := json.Marshal(reason)
+	if errMarshal != nil {
+		return `{"status":401}`
+	}
+	return string(encoded)
+}
+
+// unauthorizedHealthProbeReasonLocal 生成 401 专用的测活失败原因。
+func unauthorizedHealthProbeReasonLocal(body string) string {
+	return healthProbeFailureReasonLocal(http.StatusUnauthorized, body)
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {
@@ -2654,6 +3469,39 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 				return
 			case <-ticker.C:
 				m.checkRefreshes(ctx)
+			}
+		}
+	}()
+}
+
+// StartAutoRefreshLocal 保留原有自动刷新循环，并在本地版流程中额外加入
+// OAuth 健康定时巡检。
+func (m *Manager) StartAutoRefreshLocal(parent context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = refreshCheckInterval
+	}
+	if m.refreshCancel != nil {
+		m.refreshCancel()
+		m.refreshCancel = nil
+	}
+	ctx, cancel := context.WithCancel(parent)
+	m.refreshCancel = cancel
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		// 启动时先跑一轮：既做原有 refresh，也做本地健康巡检。
+		m.checkRefreshes(ctx)
+		m.checkAuthHealthProbesLocal(ctx)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				// 后续每个周期同时执行两件事：
+				// 1. 原有的 token 自动刷新；
+				// 2. 本地定时健康复检。
+				m.checkRefreshes(ctx)
+				m.checkAuthHealthProbesLocal(ctx)
 			}
 		}
 	}()

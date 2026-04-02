@@ -450,6 +450,11 @@ func responsesWebsocketAuthAvailableForModel(auth *coreauth.Auth, modelName stri
 	if auth == nil {
 		return false
 	}
+	// WebSocket 侧和普通轮询保持一致：只有数据库状态为 1 的账号才能继续接请求。
+	if coreauth.DBStatusForAuth(auth) != coreauth.DBStatusActive {
+		// 状态 2/3 一律挡掉，确保 WebSocket 和普通 /chat/completions 的选号口径一致。
+		return false
+	}
 	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
 		return false
 	}

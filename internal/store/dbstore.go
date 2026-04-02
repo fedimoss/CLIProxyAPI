@@ -81,15 +81,17 @@ func (s *DBTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (strin
 
 	// cli_oauth.status 约定：1=正常，2=禁用。
 	// 如果当前 auth 已明确停用，就写 2；否则保留数据库原状态，避免刷新时误改状态。
-	status := 1
+	// 这里统一把运行时状态映射回数据库状态：
+	// 1=正常，2=失活，3=额度不足。
+	status := cliproxyauth.DBStatusActive
 	if existing != nil && existing.Status != 0 {
-		status = existing.Status
+		// 普通更新时先保留数据库现有状态，避免一次无关刷新把 2/3 冲掉。
+		status = cliproxyauth.NormalizeDBStatus(existing.Status)
 	}
-	if auth.Disabled || auth.Status == cliproxyauth.StatusDisabled {
-		status = 2
-	}
+	// 如果运行时已经根据最新测活结果写出了 DBStatus，就以最新结果为准。
+	status = cliproxyauth.DBStatusForAuth(auth)
 	record.Status = status
-	if status == 2 {
+	if status == cliproxyauth.DBStatusDisabled || status == cliproxyauth.DBStatusQuotaLimited {
 		// 只要当前记录已经是禁用状态，就把原始错误串写入 error_reason。
 		// 这样后面无论是重启恢复，还是前端查看，都能看到同一份原始错误内容。
 		record.ErrorReason = disabledErrorReason(auth)
@@ -170,16 +172,28 @@ func (s *DBTokenStore) rowToAuth(item entity.CLIOauth) (*cliproxyauth.Auth, erro
 	}
 
 	// 数据库 status=2 代表明确停用；否则再回退看 metadata 里的 disabled 标记。
+	// 读库时先把状态标准化，避免旧数据或异常数据把运行时状态带偏。
+	dbStatus := cliproxyauth.NormalizeDBStatus(item.Status)
 	disabled := false
-	if item.Status == 2 {
+	switch dbStatus {
+	case cliproxyauth.DBStatusDisabled:
+		// 状态 2 是明确失活，读回内存时仍然按不可恢复的停用态处理。
 		disabled = true
-	} else if d, ok := metadata["disabled"].(bool); ok {
-		disabled = d
+	case cliproxyauth.DBStatusQuotaLimited:
+		// 状态 3 不是死号，所以不要把 Disabled 置为 true。
+		disabled = false
+	default:
+		if d, ok := metadata["disabled"].(bool); ok {
+			disabled = d
+		}
 	}
 
 	status := cliproxyauth.StatusActive
 	if disabled {
 		status = cliproxyauth.StatusDisabled
+	} else if dbStatus == cliproxyauth.DBStatusQuotaLimited {
+		// 状态 3 在运行时表现成 error+unavailable，这样既不会参与路由，又还能继续被复检。
+		status = cliproxyauth.StatusError
 	}
 
 	// path 属性保持为 ID，避免管理接口构造返回数据时拿到空路径。
@@ -194,11 +208,19 @@ func (s *DBTokenStore) rowToAuth(item entity.CLIOauth) (*cliproxyauth.Auth, erro
 		FileName:         item.ID,
 		Label:            labelFor(metadata),
 		Status:           status,
+		DBStatus:         dbStatus,
 		Disabled:         disabled,
 		Attributes:       attr,
 		Metadata:         metadata,
 		LastRefreshedAt:  time.Time{},
 		NextRefreshAfter: time.Time{},
+	}
+	if dbStatus == cliproxyauth.DBStatusQuotaLimited {
+		// 状态 3 的账号不是死号，只是额度不足。
+		// 因此运行时保持 enabled，但要标记为暂不可用，等待后续定时复检恢复。
+		auth.Unavailable = true
+		auth.Quota.Exceeded = true
+		auth.Quota.Reason = "quota"
 	}
 	if disabled && strings.TrimSpace(item.ErrorReason) != "" {
 		// 从数据库把禁用 auth 重新读回内存时，
@@ -209,6 +231,13 @@ func (s *DBTokenStore) rowToAuth(item entity.CLIOauth) (*cliproxyauth.Auth, erro
 			Message:    strings.TrimSpace(item.ErrorReason),
 			HTTPStatus: http.StatusUnauthorized,
 		}
+	} else if dbStatus == cliproxyauth.DBStatusQuotaLimited && strings.TrimSpace(item.ErrorReason) != "" {
+		// 状态 3 也保留原始原因，方便区分“额度不足”和“账号失活”。
+		auth.LastError = &cliproxyauth.Error{
+			Code:       "quota_limited",
+			Message:    strings.TrimSpace(item.ErrorReason),
+			HTTPStatus: http.StatusTooManyRequests,
+		}
 	}
 
 	if item.CreatedAt != nil {
@@ -217,7 +246,7 @@ func (s *DBTokenStore) rowToAuth(item entity.CLIOauth) (*cliproxyauth.Auth, erro
 	if item.UpdatedAt != nil {
 		auth.UpdatedAt = *item.UpdatedAt
 	}
-	if disabled && strings.TrimSpace(item.ErrorReason) != "" {
+	if (disabled || dbStatus == cliproxyauth.DBStatusQuotaLimited) && strings.TrimSpace(item.ErrorReason) != "" {
 		// 对外展示时，直接把原始错误串塞进状态说明。
 		// 不额外拼接时间和前缀，确保前端看到的内容和数据库里的 error_reason 完全一致。
 		rawReason := strings.TrimSpace(item.ErrorReason)
