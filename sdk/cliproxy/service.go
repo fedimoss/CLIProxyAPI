@@ -311,13 +311,7 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	// Register models after auth is updated in coreManager.
 	// This operation may block on network calls, but the auth configuration
 	// is already effective at this point.
-	s.registerModelsForAuth(auth)
-
-	// Refresh the scheduler entry so that the auth's supportedModelSet is rebuilt
-	// from the now-populated global model registry. Without this, newly added auths
-	// have an empty supportedModelSet (because Register/Update upserts into the
-	// scheduler before registerModelsForAuth runs) and are invisible to the scheduler.
-	s.coreManager.RefreshSchedulerEntry(auth.ID)
+	s.reconcileRuntimeAuthRegistration(auth)
 }
 
 func (s *Service) applyCoreAuthRemoval(ctx context.Context, id string) {
@@ -346,6 +340,13 @@ func (s *Service) applyRetryConfig(cfg *config.Config) {
 	}
 	maxInterval := time.Duration(cfg.MaxRetryInterval) * time.Second
 	s.coreManager.SetRetryConfig(cfg.RequestRetry, maxInterval, cfg.MaxRetryCredentials)
+}
+
+func (s *Service) oauthHealthProbeInterval(cfg *config.Config) time.Duration {
+	if cfg == nil {
+		return 15 * time.Minute
+	}
+	return cfg.OAuthHealthProbeInterval()
 }
 
 func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName string, ok bool) {
@@ -633,9 +634,11 @@ func (s *Service) Run(ctx context.Context) error {
 	var watcherWrapper *WatcherWrapper
 	reloadCallback := func(newCfg *config.Config) {
 		previousStrategy := ""
+		previousHealthProbeInterval := 15 * time.Minute
 		s.cfgMu.RLock()
 		if s.cfg != nil {
 			previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
+			previousHealthProbeInterval = s.oauthHealthProbeInterval(s.cfg)
 		}
 		s.cfgMu.RUnlock()
 
@@ -681,6 +684,11 @@ func (s *Service) Run(ctx context.Context) error {
 		if s.coreManager != nil {
 			s.coreManager.SetConfig(newCfg)
 			s.coreManager.SetOAuthModelAlias(newCfg.OAuthModelAlias)
+			nextHealthProbeInterval := s.oauthHealthProbeInterval(newCfg)
+			if previousHealthProbeInterval != nextHealthProbeInterval {
+				s.coreManager.StartAutoRefreshLocal(context.Background(), nextHealthProbeInterval)
+				log.Infof("core auth auto-refresh restarted with new interval=%s", nextHealthProbeInterval)
+			}
 		}
 		s.rebindExecutors()
 	}
@@ -705,7 +713,7 @@ func (s *Service) Run(ctx context.Context) error {
 
 	// Prefer core auth manager auto refresh if available.
 	if s.coreManager != nil {
-		interval := 15 * time.Minute
+		interval := s.oauthHealthProbeInterval(s.cfg)
 		s.coreManager.StartAutoRefreshLocal(context.Background(), interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
 	}

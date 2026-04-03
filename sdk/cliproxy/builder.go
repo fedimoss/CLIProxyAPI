@@ -238,5 +238,6 @@ func (b *Builder) Build() (*Service, error) {
 		coreManager:    coreManager,
 		serverOptions:  append([]api.ServerOption(nil), b.serverOptions...),
 	}
+	service.attachCoreAuthHook()
 	return service, nil
 }

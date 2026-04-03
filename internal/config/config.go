@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	log "github.com/sirupsen/logrus"
@@ -20,8 +21,10 @@ import (
 )
 
 const (
-	DefaultPanelGitHubRepository = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
-	DefaultPprofAddr             = "127.0.0.1:8316"
+	DefaultPanelGitHubRepository                     = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
+	DefaultPprofAddr                                 = "127.0.0.1:8316"
+	DefaultOAuthHealthProbeIntervalMinutes           = 15
+	DefaultOAuthHealthProbeMinRemainingWeeklyPercent = 90
 	// DefaultCLIUserID 用于在未显式传 cli_user_id 时，给数据库模式下的 OAuth 记录做默认关联。
 	DefaultCLIUserID = "u_10001"
 )
@@ -84,6 +87,9 @@ type Config struct {
 
 	// QuotaExceeded defines the behavior when a quota is exceeded.
 	QuotaExceeded QuotaExceeded `yaml:"quota-exceeded" json:"quota-exceeded"`
+
+	// OAuthHealthProbe controls periodic OAuth health rechecks and quota threshold decisions.
+	OAuthHealthProbe OAuthHealthProbeConfig `yaml:"oauth-health-probe" json:"oauth-health-probe"`
 
 	// Routing controls credential selection behavior.
 	Routing RoutingConfig `yaml:"routing" json:"routing"`
@@ -203,6 +209,40 @@ type QuotaExceeded struct {
 
 	// SwitchPreviewModel indicates whether to automatically switch to a preview model when a quota is exceeded.
 	SwitchPreviewModel bool `yaml:"switch-preview-model" json:"switch-preview-model"`
+}
+
+type OAuthHealthProbeConfig struct {
+	// MinRemainingWeeklyPercent is the minimum remaining weekly quota percentage
+	// required for an OAuth auth to be considered healthy.
+	MinRemainingWeeklyPercent int `yaml:"min-remaining-weekly-percent" json:"min-remaining-weekly-percent"`
+
+	// IntervalMinutes controls how often periodic OAuth health probes run.
+	IntervalMinutes int `yaml:"interval-minutes" json:"interval-minutes"`
+}
+
+func (c *Config) OAuthHealthProbeMinRemainingWeeklyPercent() int {
+	if c == nil {
+		return DefaultOAuthHealthProbeMinRemainingWeeklyPercent
+	}
+	value := c.OAuthHealthProbe.MinRemainingWeeklyPercent
+	if value <= 0 {
+		return DefaultOAuthHealthProbeMinRemainingWeeklyPercent
+	}
+	if value > 100 {
+		return 100
+	}
+	return value
+}
+
+func (c *Config) OAuthHealthProbeInterval() time.Duration {
+	if c == nil {
+		return time.Duration(DefaultOAuthHealthProbeIntervalMinutes) * time.Minute
+	}
+	minutes := c.OAuthHealthProbe.IntervalMinutes
+	if minutes <= 0 {
+		minutes = DefaultOAuthHealthProbeIntervalMinutes
+	}
+	return time.Duration(minutes) * time.Minute
 }
 
 // RoutingConfig configures how credentials are selected for requests.
@@ -1335,6 +1375,10 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 		switch fullPath {
 		case "error-logs-max-files":
 			return node.Value == "10"
+		case "oauth-health-probe.min-remaining-weekly-percent":
+			return node.Value == "90"
+		case "oauth-health-probe.interval-minutes":
+			return node.Value == "15"
 		}
 	}
 

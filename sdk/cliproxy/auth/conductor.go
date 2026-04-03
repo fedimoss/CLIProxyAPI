@@ -144,7 +144,10 @@ type Manager struct {
 	hook      Hook
 	mu        sync.RWMutex
 	auths     map[string]*Auth
-	scheduler *authScheduler
+	// inactiveAuths retains non-routable auth snapshots (for example DBStatus=2/3)
+	// so status can still be queried and quota-limited auths can be rechecked later.
+	inactiveAuths map[string]*Auth
+	scheduler     *authScheduler
 	// providerOffsets tracks per-model provider rotation state for multi-provider routing.
 	providerOffsets map[string]int
 
@@ -193,6 +196,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		selector:         selector,
 		hook:             hook,
 		auths:            make(map[string]*Auth),
+		inactiveAuths:    make(map[string]*Auth),
 		providerOffsets:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
 		refreshSemaphore: make(chan struct{}, refreshMaxConcurrency),
@@ -203,6 +207,74 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
 	manager.scheduler = newAuthScheduler(selector)
 	return manager
+}
+
+func isRuntimeActiveAuth(auth *Auth) bool {
+	if auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return false
+	}
+	if NormalizeDBStatus(DBStatusForAuth(auth)) != DBStatusActive {
+		return false
+	}
+	return !auth.Disabled && auth.Status != StatusDisabled
+}
+
+func (m *Manager) storeAuthLocked(auth *Auth) {
+	if m == nil || auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return
+	}
+	if m.auths == nil {
+		m.auths = make(map[string]*Auth)
+	}
+	if m.inactiveAuths == nil {
+		m.inactiveAuths = make(map[string]*Auth)
+	}
+	delete(m.auths, auth.ID)
+	delete(m.inactiveAuths, auth.ID)
+	if isRuntimeActiveAuth(auth) {
+		m.auths[auth.ID] = auth
+		return
+	}
+	m.inactiveAuths[auth.ID] = auth
+}
+
+func (m *Manager) authByIDLocked(id string) (*Auth, bool) {
+	if m == nil || id == "" {
+		return nil, false
+	}
+	if auth, ok := m.auths[id]; ok && auth != nil {
+		return auth, true
+	}
+	if auth, ok := m.inactiveAuths[id]; ok && auth != nil {
+		return auth, true
+	}
+	return nil, false
+}
+
+func (m *Manager) SetHook(hook Hook) Hook {
+	if m == nil {
+		return nil
+	}
+	if hook == nil {
+		hook = NoopHook{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	prev := m.hook
+	m.hook = hook
+	return prev
+}
+
+func (m *Manager) Hook() Hook {
+	if m == nil {
+		return NoopHook{}
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.hook == nil {
+		return NoopHook{}
+	}
+	return m.hook
 }
 
 func isBuiltInSelector(selector Selector) bool {
@@ -241,6 +313,7 @@ func (m *Manager) RefreshSchedulerEntry(authID string) {
 	auth, ok := m.auths[authID]
 	if !ok || auth == nil {
 		m.mu.RUnlock()
+		m.scheduler.removeAuth(authID)
 		return
 	}
 	snapshot := auth.Clone()
@@ -289,6 +362,17 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	}
 	m.runtimeConfig.Store(cfg)
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+}
+
+func (m *Manager) oauthHealthProbeMinRemainingWeeklyPercent() int {
+	if m == nil {
+		return internalconfig.DefaultOAuthHealthProbeMinRemainingWeeklyPercent
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		return internalconfig.DefaultOAuthHealthProbeMinRemainingWeeklyPercent
+	}
+	return cfg.OAuthHealthProbeMinRemainingWeeklyPercent()
 }
 
 func (m *Manager) lookupAPIKeyUpstreamModel(authID, requestedModel string) string {
@@ -751,54 +835,56 @@ func (m *Manager) rebuildAPIKeyModelAliasLocked(cfg *internalconfig.Config) {
 	}
 
 	out := make(apiKeyModelAliasTable)
-	for _, auth := range m.auths {
-		if auth == nil {
-			continue
-		}
-		if strings.TrimSpace(auth.ID) == "" {
-			continue
-		}
-		kind, _ := auth.AccountInfo()
-		if !strings.EqualFold(strings.TrimSpace(kind), "api_key") {
-			continue
-		}
+	for _, source := range []map[string]*Auth{m.auths, m.inactiveAuths} {
+		for _, auth := range source {
+			if auth == nil {
+				continue
+			}
+			if strings.TrimSpace(auth.ID) == "" {
+				continue
+			}
+			kind, _ := auth.AccountInfo()
+			if !strings.EqualFold(strings.TrimSpace(kind), "api_key") {
+				continue
+			}
 
-		byAlias := make(map[string]string)
-		provider := strings.ToLower(strings.TrimSpace(auth.Provider))
-		switch provider {
-		case "gemini":
-			if entry := resolveGeminiAPIKeyConfig(cfg, auth); entry != nil {
-				compileAPIKeyModelAliasForModels(byAlias, entry.Models)
-			}
-		case "claude":
-			if entry := resolveClaudeAPIKeyConfig(cfg, auth); entry != nil {
-				compileAPIKeyModelAliasForModels(byAlias, entry.Models)
-			}
-		case "codex":
-			if entry := resolveCodexAPIKeyConfig(cfg, auth); entry != nil {
-				compileAPIKeyModelAliasForModels(byAlias, entry.Models)
-			}
-		case "vertex":
-			if entry := resolveVertexAPIKeyConfig(cfg, auth); entry != nil {
-				compileAPIKeyModelAliasForModels(byAlias, entry.Models)
-			}
-		default:
-			// OpenAI-compat uses config selection from auth.Attributes.
-			providerKey := ""
-			compatName := ""
-			if auth.Attributes != nil {
-				providerKey = strings.TrimSpace(auth.Attributes["provider_key"])
-				compatName = strings.TrimSpace(auth.Attributes["compat_name"])
-			}
-			if compatName != "" || strings.EqualFold(strings.TrimSpace(auth.Provider), "openai-compatibility") {
-				if entry := resolveOpenAICompatConfig(cfg, providerKey, compatName, auth.Provider); entry != nil {
+			byAlias := make(map[string]string)
+			provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+			switch provider {
+			case "gemini":
+				if entry := resolveGeminiAPIKeyConfig(cfg, auth); entry != nil {
 					compileAPIKeyModelAliasForModels(byAlias, entry.Models)
 				}
+			case "claude":
+				if entry := resolveClaudeAPIKeyConfig(cfg, auth); entry != nil {
+					compileAPIKeyModelAliasForModels(byAlias, entry.Models)
+				}
+			case "codex":
+				if entry := resolveCodexAPIKeyConfig(cfg, auth); entry != nil {
+					compileAPIKeyModelAliasForModels(byAlias, entry.Models)
+				}
+			case "vertex":
+				if entry := resolveVertexAPIKeyConfig(cfg, auth); entry != nil {
+					compileAPIKeyModelAliasForModels(byAlias, entry.Models)
+				}
+			default:
+				// OpenAI-compat uses config selection from auth.Attributes.
+				providerKey := ""
+				compatName := ""
+				if auth.Attributes != nil {
+					providerKey = strings.TrimSpace(auth.Attributes["provider_key"])
+					compatName = strings.TrimSpace(auth.Attributes["compat_name"])
+				}
+				if compatName != "" || strings.EqualFold(strings.TrimSpace(auth.Provider), "openai-compatibility") {
+					if entry := resolveOpenAICompatConfig(cfg, providerKey, compatName, auth.Provider); entry != nil {
+						compileAPIKeyModelAliasForModels(byAlias, entry.Models)
+					}
+				}
 			}
-		}
 
-		if len(byAlias) > 0 {
-			out[auth.ID] = byAlias
+			if len(byAlias) > 0 {
+				out[auth.ID] = byAlias
+			}
 		}
 	}
 
@@ -916,11 +1002,15 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	auth.EnsureIndex()
 	authClone := auth.Clone()
 	m.mu.Lock()
-	m.auths[auth.ID] = authClone
+	m.storeAuthLocked(authClone)
 	m.mu.Unlock()
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	if m.scheduler != nil {
-		m.scheduler.upsertAuth(authClone)
+		if isRuntimeActiveAuth(authClone) {
+			m.scheduler.upsertAuth(authClone)
+		} else {
+			m.scheduler.removeAuth(authClone.ID)
+		}
 	}
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthRegistered(ctx, auth.Clone())
@@ -933,7 +1023,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 		return nil, nil
 	}
 	m.mu.Lock()
-	if existing, ok := m.auths[auth.ID]; ok && existing != nil {
+	if existing, ok := m.authByIDLocked(auth.ID); ok && existing != nil {
 		if !auth.indexAssigned && auth.Index == "" {
 			auth.Index = existing.Index
 			auth.indexAssigned = existing.indexAssigned
@@ -946,11 +1036,15 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	auth.EnsureIndex()
 	authClone := auth.Clone()
-	m.auths[auth.ID] = authClone
+	m.storeAuthLocked(authClone)
 	m.mu.Unlock()
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 	if m.scheduler != nil {
-		m.scheduler.upsertAuth(authClone)
+		if isRuntimeActiveAuth(authClone) {
+			m.scheduler.upsertAuth(authClone)
+		} else {
+			m.scheduler.removeAuth(authClone.ID)
+		}
 	}
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthUpdated(ctx, auth.Clone())
@@ -970,12 +1064,13 @@ func (m *Manager) Load(ctx context.Context) error {
 		return err
 	}
 	m.auths = make(map[string]*Auth, len(items))
+	m.inactiveAuths = make(map[string]*Auth, len(items))
 	for _, auth := range items {
 		if auth == nil || auth.ID == "" {
 			continue
 		}
 		auth.EnsureIndex()
-		m.auths[auth.ID] = auth.Clone()
+		m.storeAuthLocked(auth.Clone())
 	}
 	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	if cfg == nil {
@@ -1729,7 +1824,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	var authSnapshot *Auth
 
 	m.mu.Lock()
-	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
+	if auth, ok := m.authByIDLocked(result.AuthID); ok && auth != nil {
 		now := time.Now()
 
 		if result.Success {
@@ -1840,6 +1935,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
+		m.storeAuthLocked(auth)
 		if !shouldUnregisterClient {
 			_ = m.persist(ctx, auth)
 			authSnapshot = auth.Clone()
@@ -1917,10 +2013,18 @@ func (m *Manager) checkAuthHealthProbesLocal(ctx context.Context) {
 	if m == nil {
 		return
 	}
-	for _, auth := range m.snapshotAuths() {
+	auths := m.snapshotKnownAuths()
+	pending := make([]*Auth, 0, len(auths))
+	for _, auth := range auths {
 		if !supportsAuthHealthProbeLocal(auth) {
 			continue
 		}
+		pending = append(pending, auth)
+	}
+	if len(pending) > 0 {
+		log.Infof("复检开始了")
+	}
+	for _, auth := range pending {
 		go m.runAuthHealthProbeWithLimitLocal(ctx, auth.ID)
 	}
 }
@@ -2011,17 +2115,17 @@ func (m *Manager) runAuthHealthProbeLocal(parent context.Context, auth *Auth) {
 		})
 		return
 	}
-	decision := classifyAuthHealthProbeLocal(statusCode, body)
+	decision := m.classifyAuthHealthProbeLocal(statusCode, body)
 	m.applyAuthHealthProbeDecisionLocal(ctx, auth.ID, decision)
 }
 
 // classifyAuthHealthProbeLocal 根据测活响应的 HTTP 状态码和内容，分类为三种落库结果：
 // 正常（DBStatus=1）、额度不足（DBStatus=3）、账号失活（DBStatus=2）。
-func classifyAuthHealthProbeLocal(httpStatus int, body string) authHealthProbeDecisionLocal {
+func (m *Manager) classifyAuthHealthProbeLocal(httpStatus int, body string) authHealthProbeDecisionLocal {
 	// 判断顺序和外部脚本保持一致：
 	// 先看返回体里的 status_code，再看失败信号，最后区分失活还是额度不足。
 	httpStatus = normalizeAuthHealthProbeStatusCodeLocal(httpStatus, body)
-	failure := extractCliproxyFailureReasonLocal(body, healthProbeMinimumRemainingWeeklyPercent)
+	failure := extractCliproxyFailureReasonLocal(body, m.oauthHealthProbeMinRemainingWeeklyPercent())
 	if httpStatus >= http.StatusBadRequest {
 		// 只要 status_code >= 400，就先把这次测活视为失败；
 		// 然后再根据 failure 是否属于额度类问题，把结果落到 2 或 3。
@@ -2115,7 +2219,7 @@ func (m *Manager) applyAuthHealthProbeDecisionLocal(ctx context.Context, authID 
 	)
 
 	m.mu.Lock()
-	auth, ok := m.auths[authID]
+	auth, ok := m.authByIDLocked(authID)
 	if ok && auth != nil {
 		prevDBStatus := DBStatusForAuth(auth)
 		nextDBStatus := NormalizeDBStatus(decision.DBStatus)
@@ -2152,6 +2256,7 @@ func (m *Manager) applyAuthHealthProbeDecisionLocal(ctx context.Context, authID 
 			}
 			// 状态 3 不依赖冷却时间恢复，而是依赖下一轮定时复检重新判断。
 			auth.NextRetryAfter = time.Time{}
+			shouldUnregisterClient = true
 		case DBStatusDisabled:
 			// 状态 2 表示账号失活，后续不再自动复检。
 			auth.Disabled = true
@@ -2170,6 +2275,7 @@ func (m *Manager) applyAuthHealthProbeDecisionLocal(ctx context.Context, authID 
 		}
 		// 每次测活后的最新分类都立刻写库，确保重启后仍按同一结果运行。
 		// 这里故意不用测活请求自己的 ctx，避免上游探测快超时时把数据库写入一起带死。
+		m.storeAuthLocked(auth)
 		persistCtx, cancelPersist := detachedPersistContextLocal(ctx)
 		_ = m.persist(persistCtx, auth)
 		cancelPersist()
@@ -2182,7 +2288,11 @@ func (m *Manager) applyAuthHealthProbeDecisionLocal(ctx context.Context, authID 
 		registry.GetGlobalRegistry().UnregisterClient(authID)
 	}
 	if m.scheduler != nil && authSnapshot != nil {
-		m.scheduler.upsertAuth(authSnapshot)
+		if isRuntimeActiveAuth(authSnapshot) {
+			m.scheduler.upsertAuth(authSnapshot)
+		} else {
+			m.scheduler.removeAuth(authSnapshot.ID)
+		}
 	}
 	if shouldNotifyAuthUpdated && authSnapshot != nil {
 		m.hook.OnAuthUpdated(ctx, authSnapshot)
@@ -3119,7 +3229,7 @@ func (m *Manager) GetByID(id string) (*Auth, bool) {
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	auth, ok := m.auths[id]
+	auth, ok := m.authByIDLocked(id)
 	if !ok {
 		return nil, false
 	}
@@ -3557,6 +3667,19 @@ func (m *Manager) snapshotAuths() []*Auth {
 	defer m.mu.RUnlock()
 	out := make([]*Auth, 0, len(m.auths))
 	for _, a := range m.auths {
+		out = append(out, a.Clone())
+	}
+	return out
+}
+
+func (m *Manager) snapshotKnownAuths() []*Auth {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]*Auth, 0, len(m.auths)+len(m.inactiveAuths))
+	for _, a := range m.auths {
+		out = append(out, a.Clone())
+	}
+	for _, a := range m.inactiveAuths {
 		out = append(out, a.Clone())
 	}
 	return out

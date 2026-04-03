@@ -80,6 +80,12 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.QuotaExceeded.SwitchPreviewModel != newCfg.QuotaExceeded.SwitchPreviewModel {
 		changes = append(changes, fmt.Sprintf("quota-exceeded.switch-preview-model: %t -> %t", oldCfg.QuotaExceeded.SwitchPreviewModel, newCfg.QuotaExceeded.SwitchPreviewModel))
 	}
+	if oldCfg.OAuthHealthProbe.MinRemainingWeeklyPercent != newCfg.OAuthHealthProbe.MinRemainingWeeklyPercent {
+		changes = append(changes, fmt.Sprintf("oauth-health-probe.min-remaining-weekly-percent: %d -> %d", oldCfg.OAuthHealthProbe.MinRemainingWeeklyPercent, newCfg.OAuthHealthProbe.MinRemainingWeeklyPercent))
+	}
+	if oldCfg.OAuthHealthProbe.IntervalMinutes != newCfg.OAuthHealthProbe.IntervalMinutes {
+		changes = append(changes, fmt.Sprintf("oauth-health-probe.interval-minutes: %d -> %d", oldCfg.OAuthHealthProbe.IntervalMinutes, newCfg.OAuthHealthProbe.IntervalMinutes))
+	}
 
 	if oldCfg.Routing.Strategy != newCfg.Routing.Strategy {
 		changes = append(changes, fmt.Sprintf("routing.strategy: %s -> %s", oldCfg.Routing.Strategy, newCfg.Routing.Strategy))

@@ -390,3 +390,10 @@ database:
 # 在将OAuth记录导入/上传到数据库模式时使用的默认cli_user_id。
 # 如果请求中传递了cli_user_id，则以该值为准。
 cli-user-id: "u_10001"
+
+# OAuth 账号健康复检设置
+oauth-health-probe:
+  # 周额度剩余百分比低于这个值时，OAuth 账号会被判定为额度不足
+  min-remaining-weekly-percent: 90
+  # OAuth 账号定时复检的间隔，单位为分钟
+  interval-minutes: 15
