@@ -2141,11 +2141,20 @@ func (m *Manager) runAuthHealthProbeLocal(parent context.Context, auth *Auth) {
 	statusCode, body, errProbe := m.executeAuthHealthProbeLocal(ctx, auth)
 	if errProbe != nil {
 		log.WithError(errProbe).Debugf("auth health probe failed for %s (%s)", auth.Provider, auth.ID)
-		m.applyAuthHealthProbeDecisionLocal(ctx, auth.ID, authHealthProbeDecisionLocal{
+		decision := authHealthProbeDecisionLocal{
 			DBStatus:   DBStatusDisabled,
 			HTTPStatus: 0,
 			Reason:     strings.TrimSpace(errProbe.Error()),
-		})
+		}
+		if shouldRetryAuthHealthProbeAfterErrorLocal(errProbe) {
+			// 这类 "Get \"https://chatgpt.com/backend-api/wham/usage\": context deadline exceeded"
+			// 更像一次临时探测失败，不像账号已经彻底失活。
+			// 这里改落到状态 3，等待下一次定时复检重新判断，而不是直接打成状态 2。
+			decision.DBStatus = DBStatusQuotaLimited
+			decision.HTTPStatus = http.StatusServiceUnavailable
+			decision.Reason = healthProbeFailureReasonLocal(http.StatusServiceUnavailable, strings.TrimSpace(errProbe.Error()))
+		}
+		m.applyAuthHealthProbeDecisionLocal(ctx, auth.ID, decision)
 		return
 	}
 	decision := m.classifyAuthHealthProbeLocal(statusCode, body)
@@ -2172,6 +2181,16 @@ func (m *Manager) classifyAuthHealthProbeLocal(httpStatus int, body string) auth
 				DBStatus:   DBStatusQuotaLimited,
 				HTTPStatus: normalizeQuotaHealthProbeStatusCodeLocal(httpStatus),
 				Reason:     reason,
+			}
+		}
+		if shouldRetryAuthHealthProbeResponseLocal(httpStatus, body) {
+			// 当测活接口直接返回
+			// {"status":503,"detail":"Service Unavailable","message":"Get \"https://chatgpt.com/backend-api/wham/usage\": context deadline exceeded"}
+			// 这种结果时，也按状态 3 处理，保留到下一次复检再看，不在这次就判成彻底失活。
+			return authHealthProbeDecisionLocal{
+				DBStatus:   DBStatusQuotaLimited,
+				HTTPStatus: httpStatus,
+				Reason:     healthProbeFailureReasonLocal(httpStatus, body),
 			}
 		}
 		return authHealthProbeDecisionLocal{
@@ -2226,6 +2245,47 @@ func normalizeQuotaHealthProbeStatusCodeLocal(status int) int {
 		return http.StatusTooManyRequests
 	}
 	return status
+}
+
+func shouldRetryAuthHealthProbeAfterErrorLocal(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		// 测活请求本身超时，说明这次没探测成功，后续交给下一次复检。
+		return true
+	}
+	return strings.Contains(strings.ToLower(strings.TrimSpace(err.Error())), "context deadline exceeded")
+}
+
+func shouldRetryAuthHealthProbeResponseLocal(httpStatus int, body string) bool {
+	if httpStatus != http.StatusServiceUnavailable {
+		return false
+	}
+	// 只对 503 + deadline exceeded 这一类临时不可用信号放宽，
+	// 让它进入状态 3，等待下一次复检；其他 503 仍按原来的失活逻辑处理。
+	return containsDeadlineExceededSignalLocal(body)
+}
+
+func containsDeadlineExceededSignalLocal(payload any) bool {
+	decoded := decodePossibleJSONPayloadLocal(payload)
+	switch typed := decoded.(type) {
+	case string:
+		return strings.Contains(strings.ToLower(strings.TrimSpace(typed)), "context deadline exceeded")
+	case map[string]any:
+		for _, value := range typed {
+			if containsDeadlineExceededSignalLocal(value) {
+				return true
+			}
+		}
+	case []any:
+		for _, value := range typed {
+			if containsDeadlineExceededSignalLocal(value) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func detachedPersistContextLocal(ctx context.Context) (context.Context, context.CancelFunc) {
