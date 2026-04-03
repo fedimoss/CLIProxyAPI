@@ -1847,13 +1847,46 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			// 请求失败后，先尝试判断这次失败是否属于“这个 OAuth 已经永久失效”的情况。
 			// 如果命中这种情况，就不要再把它当作临时失败处理，而是直接走自动停用流程。
 			if reason, okDisable := autoDisableReason(result.Error); okDisable {
-				// 第一步：把当前 auth 改成禁用状态，并把原始错误串挂到状态里。
-				disableAuthForPermanentFailure(auth, result, reason, now)
-				// 第二步：立刻写回数据库，保证服务重启后仍然保持禁用。
+				// 与 Python 测活脚本保持一致：区分“额度不足”和“账号失活”。
+				// 先用 extractCliproxyFailureReasonLocal 检查错误内容里是否包含额度不足信号
+				// (rate_limit、usage_limit_reached、remaining_percent 低于阈值等)。
+				// 如果命中额度问题 → DBStatus=3 (可复检恢复)，否则 → DBStatus=2 (永久停用)。
+				failure := extractCliproxyFailureReasonLocal(result.Error.Message, m.oauthHealthProbeMinRemainingWeeklyPercent())
+				if failure != nil && failure.QuotaLimited {
+					// ── 额度不足：账号还活着，只是暂时不能用 ──
+					quotaReason := reason
+					if failure.Reason != "" {
+						quotaReason = failure.Reason
+					}
+					auth.DBStatus = DBStatusQuotaLimited
+					auth.Disabled = false
+					auth.Unavailable = true
+					auth.Status = StatusError
+					auth.StatusMessage = quotaReason
+					auth.UpdatedAt = now
+					auth.Quota = QuotaState{Exceeded: true, Reason: "quota"}
+					auth.LastError = &Error{
+						Code:       "quota_limited",
+						Message:    quotaReason,
+						HTTPStatus: result.Error.HTTPStatus,
+					}
+					if result.Model != "" {
+						state := ensureModelState(auth, result.Model)
+						state.Status = StatusError
+						state.StatusMessage = quotaReason
+						state.Unavailable = true
+						state.UpdatedAt = now
+					}
+				} else {
+					// ── 账号失活：永久停用 ──
+					auth.DBStatus = DBStatusDisabled
+					disableAuthForPermanentFailure(auth, result, reason, now)
+				}
+				// 立刻写回数据库，保证服务重启后仍然保持对应状态。
 				_ = m.persist(ctx, auth)
-				// 第三步：准备一份最新快照，后面交给调度器和管理页同步显示。
+				// 准备一份最新快照，后面交给调度器和管理页同步显示。
 				authSnapshot = auth.Clone()
-				// 第四步：标记稍后撤掉这个 auth 对应的模型注册。
+				// 标记稍后撤掉这个 auth 对应的模型注册。
 				// 这样后续请求路由时，就不会再选到它。
 				shouldUnregisterClient = true
 			} else if result.Model != "" {
