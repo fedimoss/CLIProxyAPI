@@ -393,6 +393,8 @@ cli-user-id: "u_10001"
 
 # OAuth 账号健康复检设置
 oauth-health-probe:
+  # OAuth 定时复检的并发数，账号数量较多时可适当调大以加快复检速度
+  max-workers: 16
   # 周额度剩余百分比低于这个值时，OAuth 账号会被判定为额度不足
   min-remaining-weekly-percent: 90
   # OAuth 账号定时复检的间隔，单位为分钟

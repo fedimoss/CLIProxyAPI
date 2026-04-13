@@ -29,6 +29,10 @@ const (
 	DefaultCLIUserID = "u_10001"
 )
 
+// DefaultOAuthHealthProbeMaxWorkers 是 OAuth 健康探测的最大并发 worker 数默认值。
+// 当配置文件中未指定 max-workers 或指定值 ≤ 0 时使用此默认值。
+const DefaultOAuthHealthProbeMaxWorkers = 16
+
 // Config represents the application's configuration, loaded from a YAML file.
 type Config struct {
 	SDKConfig `yaml:",inline"`
@@ -218,6 +222,9 @@ type OAuthHealthProbeConfig struct {
 
 	// IntervalMinutes controls how often periodic OAuth health probes run.
 	IntervalMinutes int `yaml:"interval-minutes" json:"interval-minutes"`
+
+	// MaxWorkers controls how many OAuth health probes may run in parallel.
+	MaxWorkers int `yaml:"max-workers" json:"max-workers"`
 }
 
 func (c *Config) OAuthHealthProbeMinRemainingWeeklyPercent() int {
@@ -243,6 +250,19 @@ func (c *Config) OAuthHealthProbeInterval() time.Duration {
 		minutes = DefaultOAuthHealthProbeIntervalMinutes
 	}
 	return time.Duration(minutes) * time.Minute
+}
+
+// OAuthHealthProbeMaxWorkers 返回 OAuth 健康探测允许的最大并发数。
+// 如果配置值为零或负数，则回退到 DefaultOAuthHealthProbeMaxWorkers (16)。
+func (c *Config) OAuthHealthProbeMaxWorkers() int {
+	if c == nil {
+		return DefaultOAuthHealthProbeMaxWorkers
+	}
+	workers := c.OAuthHealthProbe.MaxWorkers
+	if workers <= 0 {
+		return DefaultOAuthHealthProbeMaxWorkers
+	}
+	return workers
 }
 
 // RoutingConfig configures how credentials are selected for requests.

@@ -65,7 +65,7 @@ const (
 	refreshFailureBackoff = 5 * time.Minute
 	healthProbeTimeout    = 15 * time.Second
 	healthProbeMaxGap     = 2 * time.Minute
-	healthProbeMaxWorkers = 8
+	healthProbeMaxWorkers = internalconfig.DefaultOAuthHealthProbeMaxWorkers
 	quotaBackoffBase      = time.Second
 	quotaBackoffMax       = 30 * time.Minute
 
@@ -177,9 +177,9 @@ type Manager struct {
 	refreshCancel    context.CancelFunc
 	refreshSemaphore chan struct{}
 	// 本地健康复检状态
-	healthSemaphore chan struct{} // 限制本地健康复检的全局并发数（最多 healthProbeMaxWorkers 个同时进行）
-	healthProbeAt   sync.Map      // 记录每个 auth 上一次复检时间，用于最小间隔控制（key: authID, value: time.Time）
-	healthProbeBusy sync.Map      // 标记正在被复检的 auth，防止同一个 auth 同时跑多个探测（key: authID, value: struct{}）
+	healthSemaphore atomic.Value // 限制本地健康复检的全局并发数（最多 healthProbeMaxWorkers 个同时进行），存储 chan struct{}
+	healthProbeAt   sync.Map     // 记录每个 auth 上一次复检时间，用于最小间隔控制（key: authID, value: time.Time）
+	healthProbeBusy sync.Map     // 标记正在被复检的 auth，防止同一个 auth 同时跑多个探测（key: authID, value: struct{}）
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -200,7 +200,11 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		providerOffsets:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
 		refreshSemaphore: make(chan struct{}, refreshMaxConcurrency),
-		healthSemaphore:  make(chan struct{}, healthProbeMaxWorkers),
+		healthSemaphore: func() atomic.Value {
+			v := atomic.Value{}
+			v.Store(make(chan struct{}, healthProbeMaxWorkers))
+			return v
+		}(),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
@@ -361,7 +365,21 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 		cfg = &internalconfig.Config{}
 	}
 	m.runtimeConfig.Store(cfg)
+	// 根据最新配置重建信号量，使并发上限立即生效
+	m.setHealthProbeWorkers(cfg.OAuthHealthProbeMaxWorkers())
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+}
+
+// setHealthProbeWorkers 根据 workers 重建健康探测信号量，控制并发探测上限。
+// 传入值 ≤ 0 时回退到默认值。通过 atomic.Value.Store 原子写入，保证与探测路径无竞争。
+func (m *Manager) setHealthProbeWorkers(workers int) {
+	if m == nil {
+		return
+	}
+	if workers <= 0 {
+		workers = internalconfig.DefaultOAuthHealthProbeMaxWorkers
+	}
+	m.healthSemaphore.Store(make(chan struct{}, workers))
 }
 
 func (m *Manager) oauthHealthProbeMinRemainingWeeklyPercent() int {
@@ -2079,13 +2097,17 @@ func (m *Manager) runAuthHealthProbeWithLimitLocal(ctx context.Context, authID s
 	}
 	defer m.endAuthHealthProbeLocal(authID)
 
-	if m.healthSemaphore == nil {
+	// 通过 atomic.Value.Load 原子读取信号量，避免与 setHealthProbeWorkers 的 Store 竞竞争。
+	// 将 channel 快照到局部变量，确保 acquire/release 使用同一实例。
+	sem, _ := m.healthSemaphore.Load().(chan struct{})
+	if sem == nil {
 		m.runAuthHealthProbeLocal(ctx, auth)
 		return
 	}
 	select {
-	case m.healthSemaphore <- struct{}{}:
-		defer func() { <-m.healthSemaphore }()
+	case sem <- struct{}{}:
+		// 通过参数捕获 sem，确保 release 操作与 acquire 使用同一 channel 实例
+		defer func(ch chan struct{}) { <-ch }(sem)
 	case <-ctx.Done():
 		return
 	}
