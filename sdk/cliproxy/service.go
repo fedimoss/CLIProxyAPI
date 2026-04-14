@@ -505,7 +505,7 @@ func (s *Service) Run(ctx context.Context) error {
 			log.Warnf("failed to load auth store: %v", errLoad)
 		}
 		// DB store 加载的 auth 不经过 watcher 的 refreshAuthState，需要在此主动注册模型和 executor。
-		for _, auth := range s.coreManager.List() {
+		for _, auth := range s.coreManager.ListAll() {
 			if auth == nil || auth.ID == "" || auth.Disabled {
 				continue
 			}

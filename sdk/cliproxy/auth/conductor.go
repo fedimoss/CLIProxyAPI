@@ -3669,6 +3669,23 @@ func (m *Manager) List() []*Auth {
 	return list
 }
 
+// ListAll 返回所有账号，包括活跃池和非活跃池（状态 2/3）中的账号。
+func (m *Manager) ListAll() []*Auth {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]*Auth, 0, len(m.auths)+len(m.inactiveAuths))
+	for _, auth := range m.auths {
+		out = append(out, auth.Clone())
+	}
+	for _, auth := range m.inactiveAuths {
+		out = append(out, auth.Clone())
+	}
+	return out
+}
+
 // GetByID retrieves an auth entry by its ID.
 
 func (m *Manager) GetByID(id string) (*Auth, bool) {
