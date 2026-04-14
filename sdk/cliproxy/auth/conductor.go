@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -69,11 +70,11 @@ const (
 	quotaBackoffBase      = time.Second
 	quotaBackoffMax       = 30 * time.Minute
 
-	// 周额度剩余比例低于这个阈值时，测活会把账号标记为额度不足。
+	// 鍛ㄩ搴﹀墿浣欐瘮渚嬩綆浜庤繖涓槇鍊兼椂锛屾祴娲讳細鎶婅处鍙锋爣璁颁负棰濆害涓嶈冻銆?
 	healthProbeMinimumRemainingWeeklyPercent = 90
-	// 本地健康复检沿用 codex CLI 的 User-Agent，尽量贴近真实请求环境。
+	// 鏈湴鍋ュ悍澶嶆娌跨敤 codex CLI 鐨?User-Agent锛屽敖閲忚创杩戠湡瀹炶姹傜幆澧冦€?
 	codexHealthProbeUserAgent = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
-	// 健康复检改写账号状态后，单独给落库预留一个较短超时，避免被探测请求的超时连带取消。
+	// 鍋ュ悍澶嶆鏀瑰啓璐﹀彿鐘舵€佸悗锛屽崟鐙粰钀藉簱棰勭暀涓€涓緝鐭秴鏃讹紝閬垮厤琚帰娴嬭姹傜殑瓒呮椂杩炲甫鍙栨秷銆?
 	healthProbePersistTimeout = 5 * time.Second
 )
 
@@ -174,8 +175,9 @@ type Manager struct {
 	rtProvider RoundTripperProvider
 
 	// Auto refresh state
-	refreshCancel    context.CancelFunc
-	refreshSemaphore chan struct{}
+	// Auto refresh state
+	refreshCancel context.CancelFunc
+	refreshLoop   *authAutoRefreshLoop
 	// 本地健康复检状态
 	healthSemaphore atomic.Value // 限制本地健康复检的全局并发数（最多 healthProbeMaxWorkers 个同时进行），存储 chan struct{}
 	healthProbeAt   sync.Map     // 记录每个 auth 上一次复检时间，用于最小间隔控制（key: authID, value: time.Time）
@@ -199,7 +201,6 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		inactiveAuths:    make(map[string]*Auth),
 		providerOffsets:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
-		refreshSemaphore: make(chan struct{}, refreshMaxConcurrency),
 		healthSemaphore: func() atomic.Value {
 			v := atomic.Value{}
 			v.Store(make(chan struct{}, healthProbeMaxWorkers))
@@ -304,6 +305,16 @@ func (m *Manager) syncScheduler() {
 	m.syncSchedulerFromSnapshot(m.snapshotAuths())
 }
 
+func (m *Manager) snapshotAuths() []*Auth {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]*Auth, 0, len(m.auths))
+	for _, a := range m.auths {
+		out = append(out, a.Clone())
+	}
+	return out
+}
+
 // RefreshSchedulerEntry re-upserts a single auth into the scheduler so that its
 // supportedModelSet is rebuilt from the current global model registry state.
 // This must be called after models have been registered for a newly added auth,
@@ -323,6 +334,84 @@ func (m *Manager) RefreshSchedulerEntry(authID string) {
 	snapshot := auth.Clone()
 	m.mu.RUnlock()
 	m.scheduler.upsertAuth(snapshot)
+}
+
+// ReconcileRegistryModelStates aligns per-model runtime state with the current
+// registry snapshot for one auth.
+//
+// Supported models are reset to a clean state because re-registration already
+// cleared the registry-side cooldown/suspension snapshot. ModelStates for
+// models that are no longer present in the registry are pruned entirely so
+// renamed/removed models cannot keep auth-level status stale.
+func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID string) {
+	if m == nil || authID == "" {
+		return
+	}
+
+	supportedModels := registry.GetGlobalRegistry().GetModelsForClient(authID)
+	supported := make(map[string]struct{}, len(supportedModels))
+	for _, model := range supportedModels {
+		if model == nil {
+			continue
+		}
+		modelKey := canonicalModelKey(model.ID)
+		if modelKey == "" {
+			continue
+		}
+		supported[modelKey] = struct{}{}
+	}
+
+	var snapshot *Auth
+	now := time.Now()
+
+	m.mu.Lock()
+	auth, ok := m.auths[authID]
+	if ok && auth != nil && len(auth.ModelStates) > 0 {
+		changed := false
+		for modelKey, state := range auth.ModelStates {
+			baseModel := canonicalModelKey(modelKey)
+			if baseModel == "" {
+				baseModel = strings.TrimSpace(modelKey)
+			}
+			if _, supportedModel := supported[baseModel]; !supportedModel {
+				// Drop state for models that disappeared from the current registry
+				// snapshot. Keeping them around leaks stale errors into auth-level
+				// status, management output, and websocket fallback checks.
+				delete(auth.ModelStates, modelKey)
+				changed = true
+				continue
+			}
+			if state == nil {
+				continue
+			}
+			if modelStateIsClean(state) {
+				continue
+			}
+			resetModelState(state, now)
+			changed = true
+		}
+		if len(auth.ModelStates) == 0 {
+			auth.ModelStates = nil
+		}
+		if changed {
+			updateAggregatedAvailability(auth, now)
+			if !hasModelError(auth, now) {
+				auth.LastError = nil
+				auth.StatusMessage = ""
+				auth.Status = StatusActive
+			}
+			auth.UpdatedAt = now
+			if errPersist := m.persist(ctx, auth); errPersist != nil {
+				logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warnf("failed to persist auth changes during model state reconciliation: %v", errPersist)
+			}
+			snapshot = auth.Clone()
+		}
+	}
+	m.mu.Unlock()
+
+	if m.scheduler != nil && snapshot != nil {
+		m.scheduler.upsertAuth(snapshot)
+	}
 }
 
 func (m *Manager) SetSelector(selector Selector) {
@@ -365,13 +454,13 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 		cfg = &internalconfig.Config{}
 	}
 	m.runtimeConfig.Store(cfg)
-	// 根据最新配置重建信号量，使并发上限立即生效
+	// 鏍规嵁鏈€鏂伴厤缃噸寤轰俊鍙烽噺锛屼娇骞跺彂涓婇檺绔嬪嵆鐢熸晥
 	m.setHealthProbeWorkers(cfg.OAuthHealthProbeMaxWorkers())
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 }
 
-// setHealthProbeWorkers 根据 workers 重建健康探测信号量，控制并发探测上限。
-// 传入值 ≤ 0 时回退到默认值。通过 atomic.Value.Store 原子写入，保证与探测路径无竞争。
+// setHealthProbeWorkers 鏍规嵁 workers 閲嶅缓鍋ュ悍鎺㈡祴淇″彿閲忥紝鎺у埗骞跺彂鎺㈡祴涓婇檺銆?
+// 浼犲叆鍊?鈮?0 鏃跺洖閫€鍒伴粯璁ゅ€笺€傞€氳繃 atomic.Value.Store 鍘熷瓙鍐欏叆锛屼繚璇佷笌鎺㈡祴璺緞鏃犵珵浜夈€?
 func (m *Manager) setHealthProbeWorkers(workers int) {
 	if m == nil {
 		return
@@ -554,6 +643,31 @@ func (m *Manager) executionModelCandidates(auth *Auth, routeModel string) []stri
 	return []string{resolved}
 }
 
+func (m *Manager) selectionModelForAuth(auth *Auth, routeModel string) string {
+	requestedModel := rewriteModelForAuth(routeModel, auth)
+	if strings.TrimSpace(requestedModel) == "" {
+		requestedModel = strings.TrimSpace(routeModel)
+	}
+	resolvedModel := m.applyOAuthModelAlias(auth, requestedModel)
+	if strings.TrimSpace(resolvedModel) == "" {
+		resolvedModel = requestedModel
+	}
+	return resolvedModel
+}
+
+func (m *Manager) selectionModelKeyForAuth(auth *Auth, routeModel string) string {
+	return canonicalModelKey(m.selectionModelForAuth(auth, routeModel))
+}
+
+func (m *Manager) stateModelForExecution(auth *Auth, routeModel, upstreamModel string, pooled bool) string {
+	stateModel := executionResultModel(routeModel, upstreamModel, pooled)
+	selectionModel := m.selectionModelForAuth(auth, routeModel)
+	if canonicalModelKey(selectionModel) == canonicalModelKey(upstreamModel) && strings.TrimSpace(selectionModel) != "" {
+		return strings.TrimSpace(upstreamModel)
+	}
+	return stateModel
+}
+
 func executionResultModel(routeModel, upstreamModel string, pooled bool) string {
 	if pooled {
 		if resolved := strings.TrimSpace(upstreamModel); resolved != "" {
@@ -566,14 +680,14 @@ func executionResultModel(routeModel, upstreamModel string, pooled bool) string 
 	return strings.TrimSpace(upstreamModel)
 }
 
-func filterExecutionModels(auth *Auth, routeModel string, candidates []string, pooled bool) []string {
+func (m *Manager) filterExecutionModels(auth *Auth, routeModel string, candidates []string, pooled bool) []string {
 	if len(candidates) == 0 {
 		return nil
 	}
 	now := time.Now()
 	out := make([]string, 0, len(candidates))
 	for _, upstreamModel := range candidates {
-		stateModel := executionResultModel(routeModel, upstreamModel, pooled)
+		stateModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 		blocked, _, _ := isAuthBlockedForModel(auth, stateModel, now)
 		if blocked {
 			continue
@@ -586,12 +700,89 @@ func filterExecutionModels(auth *Auth, routeModel string, candidates []string, p
 func (m *Manager) preparedExecutionModels(auth *Auth, routeModel string) ([]string, bool) {
 	candidates := m.executionModelCandidates(auth, routeModel)
 	pooled := len(candidates) > 1
-	return filterExecutionModels(auth, routeModel, candidates, pooled), pooled
+	return m.filterExecutionModels(auth, routeModel, candidates, pooled), pooled
 }
 
 func (m *Manager) prepareExecutionModels(auth *Auth, routeModel string) []string {
 	models, _ := m.preparedExecutionModels(auth, routeModel)
 	return models
+}
+
+func (m *Manager) availableAuthsForRouteModel(auths []*Auth, provider, routeModel string, now time.Time) ([]*Auth, error) {
+	if len(auths) == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
+	}
+
+	availableByPriority := make(map[int][]*Auth)
+	cooldownCount := 0
+	var earliest time.Time
+	for _, candidate := range auths {
+		checkModel := m.selectionModelForAuth(candidate, routeModel)
+		blocked, reason, next := isAuthBlockedForModel(candidate, checkModel, now)
+		if !blocked {
+			priority := authPriority(candidate)
+			availableByPriority[priority] = append(availableByPriority[priority], candidate)
+			continue
+		}
+		if reason == blockReasonCooldown {
+			cooldownCount++
+			if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
+				earliest = next
+			}
+		}
+	}
+
+	if len(availableByPriority) == 0 {
+		if cooldownCount == len(auths) && !earliest.IsZero() {
+			providerForError := provider
+			if providerForError == "mixed" {
+				providerForError = ""
+			}
+			resetIn := earliest.Sub(now)
+			if resetIn < 0 {
+				resetIn = 0
+			}
+			return nil, newModelCooldownError(routeModel, providerForError, resetIn)
+		}
+		return nil, &Error{Code: "auth_unavailable", Message: "no auth available"}
+	}
+
+	bestPriority := 0
+	found := false
+	for priority := range availableByPriority {
+		if !found || priority > bestPriority {
+			bestPriority = priority
+			found = true
+		}
+	}
+
+	available := availableByPriority[bestPriority]
+	if len(available) > 1 {
+		sort.Slice(available, func(i, j int) bool { return available[i].ID < available[j].ID })
+	}
+	return available, nil
+}
+
+func selectionArgForSelector(selector Selector, routeModel string) string {
+	if isBuiltInSelector(selector) {
+		return ""
+	}
+	return routeModel
+}
+
+func (m *Manager) authSupportsRouteModel(registryRef *registry.ModelRegistry, auth *Auth, routeModel string) bool {
+	if registryRef == nil || auth == nil {
+		return true
+	}
+	routeKey := canonicalModelKey(routeModel)
+	if routeKey == "" {
+		return true
+	}
+	if registryRef.ClientSupportsModel(auth.ID, routeKey) {
+		return true
+	}
+	selectionKey := m.selectionModelKeyForAuth(auth, routeModel)
+	return selectionKey != "" && selectionKey != routeKey && registryRef.ClientSupportsModel(auth.ID, selectionKey)
 }
 
 func discardStreamChunks(ch <-chan cliproxyexecutor.StreamChunk) {
@@ -744,7 +935,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 	}
 	var lastErr error
 	for idx, execModel := range execModels {
-		resultModel := executionResultModel(routeModel, execModel, pooled)
+		resultModel := m.stateModelForExecution(auth, routeModel, execModel, pooled)
 		execReq := req
 		execReq.Model = execModel
 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, opts)
@@ -1030,6 +1221,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 			m.scheduler.removeAuth(authClone.ID)
 		}
 	}
+	m.queueRefreshReschedule(auth.ID)
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthRegistered(ctx, auth.Clone())
 	return auth.Clone(), nil
@@ -1064,6 +1256,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 			m.scheduler.removeAuth(authClone.ID)
 		}
 	}
+	m.queueRefreshReschedule(auth.ID)
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthUpdated(ctx, auth.Clone())
 	return auth.Clone(), nil
@@ -1235,7 +1428,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		attempted[auth.ID] = struct{}{}
 		var authErr error
 		for _, upstreamModel := range models {
-			resultModel := executionResultModel(routeModel, upstreamModel, pooled)
+			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
 			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
@@ -1313,7 +1506,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		attempted[auth.ID] = struct{}{}
 		var authErr error
 		for _, upstreamModel := range models {
-			resultModel := executionResultModel(routeModel, upstreamModel, pooled)
+			resultModel := m.stateModelForExecution(auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
@@ -1777,7 +1970,11 @@ func (m *Manager) closestCooldownWait(providers []string, model string, attempt 
 		if attempt >= effectiveRetry {
 			continue
 		}
-		blocked, reason, next := isAuthBlockedForModel(auth, model, now)
+		checkModel := model
+		if strings.TrimSpace(model) != "" {
+			checkModel = m.selectionModelForAuth(auth, model)
+		}
+		blocked, reason, next := isAuthBlockedForModel(auth, checkModel, now)
 		if !blocked || next.IsZero() || reason == blockReasonDisabled {
 			continue
 		}
@@ -1793,6 +1990,50 @@ func (m *Manager) closestCooldownWait(providers []string, model string, attempt 
 	return minWait, found
 }
 
+func (m *Manager) retryAllowed(attempt int, providers []string) bool {
+	if m == nil || attempt < 0 || len(providers) == 0 {
+		return false
+	}
+	defaultRetry := int(m.requestRetry.Load())
+	if defaultRetry < 0 {
+		defaultRetry = 0
+	}
+	providerSet := make(map[string]struct{}, len(providers))
+	for i := range providers {
+		key := strings.TrimSpace(strings.ToLower(providers[i]))
+		if key == "" {
+			continue
+		}
+		providerSet[key] = struct{}{}
+	}
+	if len(providerSet) == 0 {
+		return false
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, auth := range m.auths {
+		if auth == nil {
+			continue
+		}
+		providerKey := strings.TrimSpace(strings.ToLower(auth.Provider))
+		if _, ok := providerSet[providerKey]; !ok {
+			continue
+		}
+		effectiveRetry := defaultRetry
+		if override, ok := auth.RequestRetryOverride(); ok {
+			effectiveRetry = override
+		}
+		if effectiveRetry < 0 {
+			effectiveRetry = 0
+		}
+		if attempt < effectiveRetry {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []string, model string, maxWait time.Duration) (time.Duration, bool) {
 	if err == nil {
 		return 0, false
@@ -1800,17 +2041,31 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 	if maxWait <= 0 {
 		return 0, false
 	}
-	if status := statusCodeFromError(err); status == http.StatusOK {
+	status := statusCodeFromError(err)
+	if status == http.StatusOK {
 		return 0, false
 	}
 	if isRequestInvalidError(err) {
 		return 0, false
 	}
 	wait, found := m.closestCooldownWait(providers, model, attempt)
-	if !found || wait > maxWait {
+	if found {
+		if wait > maxWait {
+			return 0, false
+		}
+		return wait, true
+	}
+	if status != http.StatusTooManyRequests {
 		return 0, false
 	}
-	return wait, true
+	if !m.retryAllowed(attempt, providers) {
+		return 0, false
+	}
+	retryAfter := retryAfterFromError(err)
+	if retryAfter == nil || *retryAfter <= 0 || *retryAfter > maxWait {
+		return 0, false
+	}
+	return *retryAfter, true
 }
 
 func waitForCooldown(ctx context.Context, wait time.Duration) error {
@@ -1862,16 +2117,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				clearAuthStateOnSuccess(auth, now)
 			}
 		} else {
-			// 请求失败后，先尝试判断这次失败是否属于“这个 OAuth 已经永久失效”的情况。
-			// 如果命中这种情况，就不要再把它当作临时失败处理，而是直接走自动停用流程。
+			// 璇锋眰澶辫触鍚庯紝鍏堝皾璇曞垽鏂繖娆″け璐ユ槸鍚﹀睘浜庘€滆繖涓?OAuth 宸茬粡姘镐箙澶辨晥鈥濈殑鎯呭喌銆?
+			// 濡傛灉鍛戒腑杩欑鎯呭喌锛屽氨涓嶈鍐嶆妸瀹冨綋浣滀复鏃跺け璐ュ鐞嗭紝鑰屾槸鐩存帴璧拌嚜鍔ㄥ仠鐢ㄦ祦绋嬨€?
 			if reason, okDisable := autoDisableReason(result.Error); okDisable {
-				// 与 Python 测活脚本保持一致：区分“额度不足”和“账号失活”。
-				// 先用 extractCliproxyFailureReasonLocal 检查错误内容里是否包含额度不足信号
-				// (rate_limit、usage_limit_reached、remaining_percent 低于阈值等)。
-				// 如果命中额度问题 → DBStatus=3 (可复检恢复)，否则 → DBStatus=2 (永久停用)。
+				// 涓?Python 娴嬫椿鑴氭湰淇濇寔涓€鑷达細鍖哄垎鈥滈搴︿笉瓒斥€濆拰鈥滆处鍙峰け娲烩€濄€?
+				// 鍏堢敤 extractCliproxyFailureReasonLocal 妫€鏌ラ敊璇唴瀹归噷鏄惁鍖呭惈棰濆害涓嶈冻淇″彿
+				// (rate_limit銆乽sage_limit_reached銆乺emaining_percent 浣庝簬闃堝€肩瓑)銆?
+				// 濡傛灉鍛戒腑棰濆害闂 鈫?DBStatus=3 (鍙妫€鎭㈠)锛屽惁鍒?鈫?DBStatus=2 (姘镐箙鍋滅敤)銆?
 				failure := extractCliproxyFailureReasonLocal(result.Error.Message, m.oauthHealthProbeMinRemainingWeeklyPercent())
 				if failure != nil && failure.QuotaLimited {
-					// ── 额度不足：账号还活着，只是暂时不能用 ──
+					// 鈹€鈹€ 棰濆害涓嶈冻锛氳处鍙疯繕娲荤潃锛屽彧鏄殏鏃朵笉鑳界敤 鈹€鈹€
 					quotaReason := reason
 					if failure.Reason != "" {
 						quotaReason = failure.Reason
@@ -1896,19 +2151,20 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						state.UpdatedAt = now
 					}
 				} else {
-					// ── 账号失活：永久停用 ──
+					// 鈹€鈹€ 璐﹀彿澶辨椿锛氭案涔呭仠鐢?鈹€鈹€
 					auth.DBStatus = DBStatusDisabled
 					disableAuthForPermanentFailure(auth, result, reason, now)
 				}
-				// 立刻写回数据库，保证服务重启后仍然保持对应状态。
+				// 绔嬪埢鍐欏洖鏁版嵁搴擄紝淇濊瘉鏈嶅姟閲嶅惎鍚庝粛鐒朵繚鎸佸搴旂姸鎬併€?
 				_ = m.persist(ctx, auth)
-				// 准备一份最新快照，后面交给调度器和管理页同步显示。
+				// 鍑嗗涓€浠芥渶鏂板揩鐓э紝鍚庨潰浜ょ粰璋冨害鍣ㄥ拰绠＄悊椤靛悓姝ユ樉绀恒€?
 				authSnapshot = auth.Clone()
-				// 标记稍后撤掉这个 auth 对应的模型注册。
-				// 这样后续请求路由时，就不会再选到它。
+				// 鏍囪绋嶅悗鎾ゆ帀杩欎釜 auth 瀵瑰簲鐨勬ā鍨嬫敞鍐屻€?
+				// 杩欐牱鍚庣画璇锋眰璺敱鏃讹紝灏变笉浼氬啀閫夊埌瀹冦€?
 				shouldUnregisterClient = true
 			} else if result.Model != "" {
 				if !isRequestScopedNotFoundResultError(result.Error) {
+					disableCooling := quotaCooldownDisabledForAuth(auth)
 					state := ensureModelState(auth, result.Model)
 					state.Unavailable = true
 					state.Status = StatusError
@@ -1929,31 +2185,45 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					} else {
 						switch statusCode {
 						case 401:
-							next := now.Add(30 * time.Minute)
-							state.NextRetryAfter = next
-							suspendReason = "unauthorized"
-							shouldSuspendModel = true
+							if disableCooling {
+								state.NextRetryAfter = time.Time{}
+							} else {
+								next := now.Add(30 * time.Minute)
+								state.NextRetryAfter = next
+								suspendReason = "unauthorized"
+								shouldSuspendModel = true
+							}
 						case 402, 403:
-							next := now.Add(30 * time.Minute)
-							state.NextRetryAfter = next
-							suspendReason = "payment_required"
-							shouldSuspendModel = true
+							if disableCooling {
+								state.NextRetryAfter = time.Time{}
+							} else {
+								next := now.Add(30 * time.Minute)
+								state.NextRetryAfter = next
+								suspendReason = "payment_required"
+								shouldSuspendModel = true
+							}
 						case 404:
-							next := now.Add(12 * time.Hour)
-							state.NextRetryAfter = next
-							suspendReason = "not_found"
-							shouldSuspendModel = true
+							if disableCooling {
+								state.NextRetryAfter = time.Time{}
+							} else {
+								next := now.Add(12 * time.Hour)
+								state.NextRetryAfter = next
+								suspendReason = "not_found"
+								shouldSuspendModel = true
+							}
 						case 429:
 							var next time.Time
 							backoffLevel := state.Quota.BackoffLevel
-							if result.RetryAfter != nil {
-								next = now.Add(*result.RetryAfter)
-							} else {
-								cooldown, nextLevel := nextQuotaCooldown(backoffLevel, quotaCooldownDisabledForAuth(auth))
-								if cooldown > 0 {
-									next = now.Add(cooldown)
+							if !disableCooling {
+								if result.RetryAfter != nil {
+									next = now.Add(*result.RetryAfter)
+								} else {
+									cooldown, nextLevel := nextQuotaCooldown(backoffLevel, disableCooling)
+									if cooldown > 0 {
+										next = now.Add(cooldown)
+									}
+									backoffLevel = nextLevel
 								}
-								backoffLevel = nextLevel
 							}
 							state.NextRetryAfter = next
 							state.Quota = QuotaState{
@@ -1962,11 +2232,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								NextRecoverAt: next,
 								BackoffLevel:  backoffLevel,
 							}
-							suspendReason = "quota"
-							shouldSuspendModel = true
-							setModelQuota = true
+							if !disableCooling {
+								suspendReason = "quota"
+								shouldSuspendModel = true
+								setModelQuota = true
+							}
 						case 408, 500, 502, 503, 504:
-							if quotaCooldownDisabledForAuth(auth) {
+							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
 								next := now.Add(1 * time.Minute)
@@ -1994,8 +2266,8 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	m.mu.Unlock()
 	if shouldUnregisterClient {
-		// 这里才真正把这个 auth 对应的模型从注册表里移除。
-		// 即使它还保留在内存 auth 列表中，也不会再参与后续请求路由。
+		// 杩欓噷鎵嶇湡姝ｆ妸杩欎釜 auth 瀵瑰簲鐨勬ā鍨嬩粠娉ㄥ唽琛ㄩ噷绉婚櫎銆?
+		// 鍗充娇瀹冭繕淇濈暀鍦ㄥ唴瀛?auth 鍒楄〃涓紝涔熶笉浼氬啀鍙備笌鍚庣画璇锋眰璺敱銆?
 		registry.GetGlobalRegistry().UnregisterClient(result.AuthID)
 	}
 	if m.scheduler != nil && authSnapshot != nil {
@@ -2017,15 +2289,15 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	m.hook.OnResult(ctx, result)
 }
 
-// MarkResultLocal 复用原有结果处理逻辑，并在本地版流程中为成功的 OAuth
-// 请求补上一条后台健康复检链路。
+// MarkResultLocal 澶嶇敤鍘熸湁缁撴灉澶勭悊閫昏緫锛屽苟鍦ㄦ湰鍦扮増娴佺▼涓负鎴愬姛鐨?OAuth
+// 璇锋眰琛ヤ笂涓€鏉″悗鍙板仴搴峰妫€閾捐矾銆?
 func (m *Manager) MarkResultLocal(ctx context.Context, result Result) {
 	m.MarkResult(ctx, result)
 	if m == nil || !result.Success {
 		return
 	}
-	// 只有主请求已经成功时，才在后台补做一次“额度/健康”复检。
-	// 这样不会拖慢当前响应，但能尽快把已经失效的 OAuth 清出可用池。
+	// 鍙湁涓昏姹傚凡缁忔垚鍔熸椂锛屾墠鍦ㄥ悗鍙拌ˉ鍋氫竴娆♀€滈搴?鍋ュ悍鈥濆妫€銆?
+	// 杩欐牱涓嶄細鎷栨參褰撳墠鍝嶅簲锛屼絾鑳藉敖蹇妸宸茬粡澶辨晥鐨?OAuth 娓呭嚭鍙敤姹犮€?
 	m.scheduleAuthHealthProbeLocal(result.AuthID)
 }
 
@@ -2040,16 +2312,16 @@ type authHealthProbeFailureLocal struct {
 	QuotaLimited bool
 }
 
-// authHealthProbeDecisionLocal 表示一次测活后的最终落库结果。
-// DBStatus 会直接影响账号是否继续轮询、是否继续参与后续定时复检。
+// authHealthProbeDecisionLocal 琛ㄧず涓€娆℃祴娲诲悗鐨勬渶缁堣惤搴撶粨鏋溿€?
+// DBStatus 浼氱洿鎺ュ奖鍝嶈处鍙锋槸鍚︾户缁疆璇€佹槸鍚︾户缁弬涓庡悗缁畾鏃跺妫€銆?
 type authHealthProbeDecisionLocal struct {
 	DBStatus   int
 	HTTPStatus int
 	Reason     string
 }
 
-// scheduleAuthHealthProbeLocal 异步触发单个 auth 的本地健康复检。
-// 这里故意不阻塞当前请求，让复检结果只影响后续请求。
+// scheduleAuthHealthProbeLocal 寮傛瑙﹀彂鍗曚釜 auth 鐨勬湰鍦板仴搴峰妫€銆?
+// 杩欓噷鏁呮剰涓嶉樆濉炲綋鍓嶈姹傦紝璁╁妫€缁撴灉鍙奖鍝嶅悗缁姹傘€?
 func (m *Manager) scheduleAuthHealthProbeLocal(authID string) {
 	authID = strings.TrimSpace(authID)
 	if m == nil || authID == "" {
@@ -2058,8 +2330,8 @@ func (m *Manager) scheduleAuthHealthProbeLocal(authID string) {
 	go m.runAuthHealthProbeWithLimitLocal(context.Background(), authID)
 }
 
-// checkAuthHealthProbesLocal 用于定时巡检仍可被复检的 OAuth 账号（DBStatus 为 1 或 3）。
-// 它和”成功后异步复检”共用同一套底层探测逻辑，只是触发时机不同。
+// checkAuthHealthProbesLocal 鐢ㄤ簬瀹氭椂宸℃浠嶅彲琚妫€鐨?OAuth 璐﹀彿锛圖BStatus 涓?1 鎴?3锛夈€?
+// 瀹冨拰鈥濇垚鍔熷悗寮傛澶嶆鈥濆叡鐢ㄥ悓涓€濂楀簳灞傛帰娴嬮€昏緫锛屽彧鏄Е鍙戞椂鏈轰笉鍚屻€?
 func (m *Manager) checkAuthHealthProbesLocal(ctx context.Context) {
 	if m == nil {
 		return
@@ -2073,16 +2345,16 @@ func (m *Manager) checkAuthHealthProbesLocal(ctx context.Context) {
 		pending = append(pending, auth)
 	}
 	if len(pending) > 0 {
-		log.Infof("复检开始了")
+		log.Infof("澶嶆寮€濮嬩簡")
 	}
 	for _, auth := range pending {
 		go m.runAuthHealthProbeWithLimitLocal(ctx, auth.ID)
 	}
 }
 
-// runAuthHealthProbeWithLimitLocal 负责给本地健康复检加两层保护：
-// 1. 同一个 auth 同一时间只允许跑一个复检；
-// 2. 全局并发数受限，避免一次性打太多探测请求。
+// runAuthHealthProbeWithLimitLocal 璐熻矗缁欐湰鍦板仴搴峰妫€鍔犱袱灞備繚鎶わ細
+// 1. 鍚屼竴涓?auth 鍚屼竴鏃堕棿鍙厑璁歌窇涓€涓妫€锛?
+// 2. 鍏ㄥ眬骞跺彂鏁板彈闄愶紝閬垮厤涓€娆℃€ф墦澶鎺㈡祴璇锋眰銆?
 func (m *Manager) runAuthHealthProbeWithLimitLocal(ctx context.Context, authID string) {
 	authID = strings.TrimSpace(authID)
 	if m == nil || authID == "" {
@@ -2097,8 +2369,8 @@ func (m *Manager) runAuthHealthProbeWithLimitLocal(ctx context.Context, authID s
 	}
 	defer m.endAuthHealthProbeLocal(authID)
 
-	// 通过 atomic.Value.Load 原子读取信号量，避免与 setHealthProbeWorkers 的 Store 竞竞争。
-	// 将 channel 快照到局部变量，确保 acquire/release 使用同一实例。
+	// 閫氳繃 atomic.Value.Load 鍘熷瓙璇诲彇淇″彿閲忥紝閬垮厤涓?setHealthProbeWorkers 鐨?Store 绔炵珵浜夈€?
+	// 灏?channel 蹇収鍒板眬閮ㄥ彉閲忥紝纭繚 acquire/release 浣跨敤鍚屼竴瀹炰緥銆?
 	sem, _ := m.healthSemaphore.Load().(chan struct{})
 	if sem == nil {
 		m.runAuthHealthProbeLocal(ctx, auth)
@@ -2106,7 +2378,7 @@ func (m *Manager) runAuthHealthProbeWithLimitLocal(ctx context.Context, authID s
 	}
 	select {
 	case sem <- struct{}{}:
-		// 通过参数捕获 sem，确保 release 操作与 acquire 使用同一 channel 实例
+		// 閫氳繃鍙傛暟鎹曡幏 sem锛岀‘淇?release 鎿嶄綔涓?acquire 浣跨敤鍚屼竴 channel 瀹炰緥
 		defer func(ch chan struct{}) { <-ch }(sem)
 	case <-ctx.Done():
 		return
@@ -2114,8 +2386,8 @@ func (m *Manager) runAuthHealthProbeWithLimitLocal(ctx context.Context, authID s
 	m.runAuthHealthProbeLocal(ctx, auth)
 }
 
-// beginAuthHealthProbeLocal 判断这次复检是否允许开始。
-// 这里会做最小间隔控制，避免同一个 auth 在短时间内被反复探测。
+// beginAuthHealthProbeLocal 鍒ゆ柇杩欐澶嶆鏄惁鍏佽寮€濮嬨€?
+// 杩欓噷浼氬仛鏈€灏忛棿闅旀帶鍒讹紝閬垮厤鍚屼竴涓?auth 鍦ㄧ煭鏃堕棿鍐呰鍙嶅鎺㈡祴銆?
 func (m *Manager) beginAuthHealthProbeLocal(authID string, now time.Time) (*Auth, bool) {
 	if m == nil {
 		return nil, false
@@ -2137,7 +2409,7 @@ func (m *Manager) beginAuthHealthProbeLocal(authID string, now time.Time) (*Auth
 	return auth, true
 }
 
-// endAuthHealthProbeLocal 在复检结束后释放“正在复检”的占位标记。
+// endAuthHealthProbeLocal 鍦ㄥ妫€缁撴潫鍚庨噴鏀锯€滄鍦ㄥ妫€鈥濈殑鍗犱綅鏍囪銆?
 func (m *Manager) endAuthHealthProbeLocal(authID string) {
 	if m == nil {
 		return
@@ -2145,10 +2417,10 @@ func (m *Manager) endAuthHealthProbeLocal(authID string) {
 	m.healthProbeBusy.Delete(strings.TrimSpace(authID))
 }
 
-// runAuthHealthProbeLocal 真正执行一次健康复检。
-// 探测结果通过 classifyAuthHealthProbeLocal 分类为三态：
-// 正常（DBStatus=1）、额度不足（DBStatus=3）、账号失活（DBStatus=2），
-// 再通过 applyAuthHealthProbeDecisionLocal 写回 auth 并落库。
+// runAuthHealthProbeLocal 鐪熸鎵ц涓€娆″仴搴峰妫€銆?
+// 鎺㈡祴缁撴灉閫氳繃 classifyAuthHealthProbeLocal 鍒嗙被涓轰笁鎬侊細
+// 姝ｅ父锛圖BStatus=1锛夈€侀搴︿笉瓒筹紙DBStatus=3锛夈€佽处鍙峰け娲伙紙DBStatus=2锛夛紝
+// 鍐嶉€氳繃 applyAuthHealthProbeDecisionLocal 鍐欏洖 auth 骞惰惤搴撱€?
 func (m *Manager) runAuthHealthProbeLocal(parent context.Context, auth *Auth) {
 	if m == nil || auth == nil {
 		return
@@ -2169,9 +2441,9 @@ func (m *Manager) runAuthHealthProbeLocal(parent context.Context, auth *Auth) {
 			Reason:     strings.TrimSpace(errProbe.Error()),
 		}
 		if shouldRetryAuthHealthProbeAfterErrorLocal(errProbe) {
-			// 这类 "Get \"https://chatgpt.com/backend-api/wham/usage\": context deadline exceeded"
-			// 更像一次临时探测失败，不像账号已经彻底失活。
-			// 这里改落到状态 3，等待下一次定时复检重新判断，而不是直接打成状态 2。
+			// 杩欑被 "Get \"https://chatgpt.com/backend-api/wham/usage\": context deadline exceeded"
+			// 鏇村儚涓€娆′复鏃舵帰娴嬪け璐ワ紝涓嶅儚璐﹀彿宸茬粡褰诲簳澶辨椿銆?
+			// 杩欓噷鏀硅惤鍒扮姸鎬?3锛岀瓑寰呬笅涓€娆″畾鏃跺妫€閲嶆柊鍒ゆ柇锛岃€屼笉鏄洿鎺ユ墦鎴愮姸鎬?2銆?
 			decision.DBStatus = DBStatusQuotaLimited
 			decision.HTTPStatus = http.StatusServiceUnavailable
 			decision.Reason = healthProbeFailureReasonLocal(http.StatusServiceUnavailable, strings.TrimSpace(errProbe.Error()))
@@ -2183,19 +2455,19 @@ func (m *Manager) runAuthHealthProbeLocal(parent context.Context, auth *Auth) {
 	m.applyAuthHealthProbeDecisionLocal(ctx, auth.ID, decision)
 }
 
-// classifyAuthHealthProbeLocal 根据测活响应的 HTTP 状态码和内容，分类为三种落库结果：
-// 正常（DBStatus=1）、额度不足（DBStatus=3）、账号失活（DBStatus=2）。
+// classifyAuthHealthProbeLocal 鏍规嵁娴嬫椿鍝嶅簲鐨?HTTP 鐘舵€佺爜鍜屽唴瀹癸紝鍒嗙被涓轰笁绉嶈惤搴撶粨鏋滐細
+// 姝ｅ父锛圖BStatus=1锛夈€侀搴︿笉瓒筹紙DBStatus=3锛夈€佽处鍙峰け娲伙紙DBStatus=2锛夈€?
 func (m *Manager) classifyAuthHealthProbeLocal(httpStatus int, body string) authHealthProbeDecisionLocal {
-	// 判断顺序和外部脚本保持一致：
-	// 先看返回体里的 status_code，再看失败信号，最后区分失活还是额度不足。
+	// 鍒ゆ柇椤哄簭鍜屽閮ㄨ剼鏈繚鎸佷竴鑷达細
+	// 鍏堢湅杩斿洖浣撻噷鐨?status_code锛屽啀鐪嬪け璐ヤ俊鍙凤紝鏈€鍚庡尯鍒嗗け娲昏繕鏄搴︿笉瓒炽€?
 	httpStatus = normalizeAuthHealthProbeStatusCodeLocal(httpStatus, body)
 	failure := extractCliproxyFailureReasonLocal(body, m.oauthHealthProbeMinRemainingWeeklyPercent())
 	if httpStatus >= http.StatusBadRequest {
-		// 只要 status_code >= 400，就先把这次测活视为失败；
-		// 然后再根据 failure 是否属于额度类问题，把结果落到 2 或 3。
+		// 鍙 status_code >= 400锛屽氨鍏堟妸杩欐娴嬫椿瑙嗕负澶辫触锛?
+		// 鐒跺悗鍐嶆牴鎹?failure 鏄惁灞炰簬棰濆害绫婚棶棰橈紝鎶婄粨鏋滆惤鍒?2 鎴?3銆?
 		reason := "HTTP " + strconv.Itoa(httpStatus)
 		if failure != nil && strings.TrimSpace(failure.Reason) != "" {
-			// 如果返回体里已经带了更具体的失败原因，优先展示它，不保留笼统的 HTTP 文案。
+			// 濡傛灉杩斿洖浣撻噷宸茬粡甯︿簡鏇村叿浣撶殑澶辫触鍘熷洜锛屼紭鍏堝睍绀哄畠锛屼笉淇濈暀绗肩粺鐨?HTTP 鏂囨銆?
 			reason = strings.TrimSpace(failure.Reason)
 		}
 		if failure != nil && failure.QuotaLimited {
@@ -2206,9 +2478,9 @@ func (m *Manager) classifyAuthHealthProbeLocal(httpStatus int, body string) auth
 			}
 		}
 		if shouldRetryAuthHealthProbeResponseLocal(httpStatus, body) {
-			// 当测活接口直接返回
+			// 褰撴祴娲绘帴鍙ｇ洿鎺ヨ繑鍥?
 			// {"status":503,"detail":"Service Unavailable","message":"Get \"https://chatgpt.com/backend-api/wham/usage\": context deadline exceeded"}
-			// 这种结果时，也按状态 3 处理，保留到下一次复检再看，不在这次就判成彻底失活。
+			// 杩欑缁撴灉鏃讹紝涔熸寜鐘舵€?3 澶勭悊锛屼繚鐣欏埌涓嬩竴娆″妫€鍐嶇湅锛屼笉鍦ㄨ繖娆″氨鍒ゆ垚褰诲簳澶辨椿銆?
 			return authHealthProbeDecisionLocal{
 				DBStatus:   DBStatusQuotaLimited,
 				HTTPStatus: httpStatus,
@@ -2222,11 +2494,11 @@ func (m *Manager) classifyAuthHealthProbeLocal(httpStatus int, body string) auth
 		}
 	}
 	if failure != nil && strings.TrimSpace(failure.Reason) != "" {
-		// status_code 本身正常时，再看内容里有没有坏信号或额度不足信号。
+		// status_code 鏈韩姝ｅ父鏃讹紝鍐嶇湅鍐呭閲屾湁娌℃湁鍧忎俊鍙锋垨棰濆害涓嶈冻淇″彿銆?
 		status := DBStatusDisabled
 		httpStatusForReason := httpStatus
 		if failure.QuotaLimited {
-			// 额度问题不打成死号，而是落到状态 3，等待后续定时复检恢复。
+			// 棰濆害闂涓嶆墦鎴愭鍙凤紝鑰屾槸钀藉埌鐘舵€?3锛岀瓑寰呭悗缁畾鏃跺妫€鎭㈠銆?
 			status = DBStatusQuotaLimited
 			httpStatusForReason = normalizeQuotaHealthProbeStatusCodeLocal(httpStatusForReason)
 		}
@@ -2242,27 +2514,27 @@ func (m *Manager) classifyAuthHealthProbeLocal(httpStatus int, body string) auth
 	}
 }
 
-// normalizeAuthHealthProbeStatusCodeLocal 优先取响应体内的 status_code，回退到 HTTP 状态码。
+// normalizeAuthHealthProbeStatusCodeLocal 浼樺厛鍙栧搷搴斾綋鍐呯殑 status_code锛屽洖閫€鍒?HTTP 鐘舵€佺爜銆?
 func normalizeAuthHealthProbeStatusCodeLocal(httpStatus int, body string) int {
-	// 如果响应体里已经带了 status_code，就以它为准；
-	// 这和外部脚本的判断方式保持一致。
+	// 濡傛灉鍝嶅簲浣撻噷宸茬粡甯︿簡 status_code锛屽氨浠ュ畠涓哄噯锛?
+	// 杩欏拰澶栭儴鑴氭湰鐨勫垽鏂柟寮忎繚鎸佷竴鑷淬€?
 	decoded := decodePossibleJSONPayloadLocal(body)
 	if data, ok := decoded.(map[string]any); ok {
 		if statusCode, okStatus := intValueFromAnyLocal(data["status_code"]); okStatus && statusCode > 0 {
-			// 这里优先使用响应体里的 status_code，避免被外层 200 掩盖真实失败。
+			// 杩欓噷浼樺厛浣跨敤鍝嶅簲浣撻噷鐨?status_code锛岄伩鍏嶈澶栧眰 200 鎺╃洊鐪熷疄澶辫触銆?
 			return statusCode
 		}
 	}
 	if httpStatus > 0 {
-		// 只有响应体没带 status_code 时，才回退到 HTTP 层状态码。
+		// 鍙湁鍝嶅簲浣撴病甯?status_code 鏃讹紝鎵嶅洖閫€鍒?HTTP 灞傜姸鎬佺爜銆?
 		return httpStatus
 	}
 	return http.StatusOK
 }
 
-// normalizeQuotaHealthProbeStatusCodeLocal 额度不足时把 0 或 200 统一归一成 429，便于后续展示和排查。
+// normalizeQuotaHealthProbeStatusCodeLocal 棰濆害涓嶈冻鏃舵妸 0 鎴?200 缁熶竴褰掍竴鎴?429锛屼究浜庡悗缁睍绀哄拰鎺掓煡銆?
 func normalizeQuotaHealthProbeStatusCodeLocal(status int) int {
-	// 额度不足统一归一成 429，便于后续展示和排查。
+	// 棰濆害涓嶈冻缁熶竴褰掍竴鎴?429锛屼究浜庡悗缁睍绀哄拰鎺掓煡銆?
 	if status == 0 || status == http.StatusOK {
 		return http.StatusTooManyRequests
 	}
@@ -2274,7 +2546,7 @@ func shouldRetryAuthHealthProbeAfterErrorLocal(err error) bool {
 		return false
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
-		// 测活请求本身超时，说明这次没探测成功，后续交给下一次复检。
+		// 娴嬫椿璇锋眰鏈韩瓒呮椂锛岃鏄庤繖娆℃病鎺㈡祴鎴愬姛锛屽悗缁氦缁欎笅涓€娆″妫€銆?
 		return true
 	}
 	return strings.Contains(strings.ToLower(strings.TrimSpace(err.Error())), "context deadline exceeded")
@@ -2284,8 +2556,8 @@ func shouldRetryAuthHealthProbeResponseLocal(httpStatus int, body string) bool {
 	if httpStatus != http.StatusServiceUnavailable {
 		return false
 	}
-	// 只对 503 + deadline exceeded 这一类临时不可用信号放宽，
-	// 让它进入状态 3，等待下一次复检；其他 503 仍按原来的失活逻辑处理。
+	// 鍙 503 + deadline exceeded 杩欎竴绫讳复鏃朵笉鍙敤淇″彿鏀惧锛?
+	// 璁╁畠杩涘叆鐘舵€?3锛岀瓑寰呬笅涓€娆″妫€锛涘叾浠?503 浠嶆寜鍘熸潵鐨勫け娲婚€昏緫澶勭悊銆?
 	return containsDeadlineExceededSignalLocal(body)
 }
 
@@ -2311,9 +2583,9 @@ func containsDeadlineExceededSignalLocal(payload any) bool {
 }
 
 func detachedPersistContextLocal(ctx context.Context) (context.Context, context.CancelFunc) {
-	// 测活请求本身带有 15 秒超时。
-	// 如果把同一个 ctx 继续传给落库，前面的 HTTP 探测一旦接近超时，
-	// 后面的 SELECT/UPDATE 还没开始就可能直接拿到 context deadline exceeded。
+	// 娴嬫椿璇锋眰鏈韩甯︽湁 15 绉掕秴鏃躲€?
+	// 濡傛灉鎶婂悓涓€涓?ctx 缁х画浼犵粰钀藉簱锛屽墠闈㈢殑 HTTP 鎺㈡祴涓€鏃︽帴杩戣秴鏃讹紝
+	// 鍚庨潰鐨?SELECT/UPDATE 杩樻病寮€濮嬪氨鍙兘鐩存帴鎷垮埌 context deadline exceeded銆?
 	persistCtx, cancel := context.WithTimeout(context.Background(), healthProbePersistTimeout)
 	if shouldSkipPersist(ctx) {
 		persistCtx = WithSkipPersist(persistCtx)
@@ -2338,12 +2610,12 @@ func (m *Manager) applyAuthHealthProbeDecisionLocal(ctx context.Context, authID 
 	if ok && auth != nil {
 		prevDBStatus := DBStatusForAuth(auth)
 		nextDBStatus := NormalizeDBStatus(decision.DBStatus)
-		// 先把最新测活结论写回 auth，后面的持久化和调度都以它为准。
+		// 鍏堟妸鏈€鏂版祴娲荤粨璁哄啓鍥?auth锛屽悗闈㈢殑鎸佷箙鍖栧拰璋冨害閮戒互瀹冧负鍑嗐€?
 		auth.DBStatus = nextDBStatus
 		auth.UpdatedAt = now
 		switch nextDBStatus {
 		case DBStatusActive:
-			// 只有从状态 3 恢复到状态 1 时，才清理额度不足留下的运行时痕迹。
+			// 鍙湁浠庣姸鎬?3 鎭㈠鍒扮姸鎬?1 鏃讹紝鎵嶆竻鐞嗛搴︿笉瓒崇暀涓嬬殑杩愯鏃剁棔杩广€?
 			if prevDBStatus == DBStatusQuotaLimited {
 				auth.Disabled = false
 				auth.Status = StatusActive
@@ -2354,11 +2626,11 @@ func (m *Manager) applyAuthHealthProbeDecisionLocal(ctx context.Context, authID 
 				auth.NextRetryAfter = time.Time{}
 			}
 		case DBStatusQuotaLimited:
-			// 状态 3 表示账号还活着，但额度不足，不能继续参与请求轮询。
+			// 鐘舵€?3 琛ㄧず璐﹀彿杩樻椿鐫€锛屼絾棰濆害涓嶈冻锛屼笉鑳界户缁弬涓庤姹傝疆璇€?
 			auth.Disabled = false
 			auth.Status = StatusError
 			auth.Unavailable = true
-			// 这里保留原始原因，方便后续排查到底是“额度耗尽”还是“剩余低于 20%”。
+			// 杩欓噷淇濈暀鍘熷鍘熷洜锛屾柟渚垮悗缁帓鏌ュ埌搴曟槸鈥滈搴﹁€楀敖鈥濊繕鏄€滃墿浣欎綆浜?20%鈥濄€?
 			auth.StatusMessage = strings.TrimSpace(decision.Reason)
 			auth.LastError = &Error{
 				Code:       "quota_limited",
@@ -2369,11 +2641,11 @@ func (m *Manager) applyAuthHealthProbeDecisionLocal(ctx context.Context, authID 
 				Exceeded: true,
 				Reason:   "quota",
 			}
-			// 状态 3 不依赖冷却时间恢复，而是依赖下一轮定时复检重新判断。
+			// 鐘舵€?3 涓嶄緷璧栧喎鍗存椂闂存仮澶嶏紝鑰屾槸渚濊禆涓嬩竴杞畾鏃跺妫€閲嶆柊鍒ゆ柇銆?
 			auth.NextRetryAfter = time.Time{}
 			shouldUnregisterClient = true
 		case DBStatusDisabled:
-			// 状态 2 表示账号失活，后续不再自动复检。
+			// 鐘舵€?2 琛ㄧず璐﹀彿澶辨椿锛屽悗缁笉鍐嶈嚜鍔ㄥ妫€銆?
 			auth.Disabled = true
 			auth.Unavailable = false
 			auth.Status = StatusDisabled
@@ -2385,11 +2657,11 @@ func (m *Manager) applyAuthHealthProbeDecisionLocal(ctx context.Context, authID 
 			}
 			auth.Quota = QuotaState{}
 			auth.NextRetryAfter = time.Time{}
-			// 状态 2 需要立刻从注册表中移除，避免后续请求继续命中这条账号。
+			// 鐘舵€?2 闇€瑕佺珛鍒讳粠娉ㄥ唽琛ㄤ腑绉婚櫎锛岄伩鍏嶅悗缁姹傜户缁懡涓繖鏉¤处鍙枫€?
 			shouldUnregisterClient = true
 		}
-		// 每次测活后的最新分类都立刻写库，确保重启后仍按同一结果运行。
-		// 这里故意不用测活请求自己的 ctx，避免上游探测快超时时把数据库写入一起带死。
+		// 姣忔娴嬫椿鍚庣殑鏈€鏂板垎绫婚兘绔嬪埢鍐欏簱锛岀‘淇濋噸鍚悗浠嶆寜鍚屼竴缁撴灉杩愯銆?
+		// 杩欓噷鏁呮剰涓嶇敤娴嬫椿璇锋眰鑷繁鐨?ctx锛岄伩鍏嶄笂娓告帰娴嬪揩瓒呮椂鏃舵妸鏁版嵁搴撳啓鍏ヤ竴璧峰甫姝汇€?
 		m.storeAuthLocked(auth)
 		persistCtx, cancelPersist := detachedPersistContextLocal(ctx)
 		_ = m.persist(persistCtx, auth)
@@ -2414,11 +2686,11 @@ func (m *Manager) applyAuthHealthProbeDecisionLocal(ctx context.Context, authID 
 	}
 }
 
-// executeAuthHealthProbeLocal 发起一次实际的健康探测请求。
-// 这里复用当前 auth 自己的 HttpRequest 能力，保证探测时使用的
-// 凭证、代理、请求头和主请求尽量一致。
-// 具体“探测哪个地址、用什么方法”由提供方适配层决定，
-// 这样后面新增其他提供方时，只需要补自己的 spec 生成逻辑。
+// executeAuthHealthProbeLocal 鍙戣捣涓€娆″疄闄呯殑鍋ュ悍鎺㈡祴璇锋眰銆?
+// 杩欓噷澶嶇敤褰撳墠 auth 鑷繁鐨?HttpRequest 鑳藉姏锛屼繚璇佹帰娴嬫椂浣跨敤鐨?
+// 鍑瘉銆佷唬鐞嗐€佽姹傚ご鍜屼富璇锋眰灏介噺涓€鑷淬€?
+// 鍏蜂綋鈥滄帰娴嬪摢涓湴鍧€銆佺敤浠€涔堟柟娉曗€濈敱鎻愪緵鏂归€傞厤灞傚喅瀹氾紝
+// 杩欐牱鍚庨潰鏂板鍏朵粬鎻愪緵鏂规椂锛屽彧闇€瑕佽ˉ鑷繁鐨?spec 鐢熸垚閫昏緫銆?
 func (m *Manager) executeAuthHealthProbeLocal(ctx context.Context, auth *Auth) (int, string, error) {
 	if m == nil || auth == nil {
 		return 0, "", &Error{Code: "auth_not_found", Message: "auth is nil"}
@@ -2460,29 +2732,29 @@ func (m *Manager) executeAuthHealthProbeLocal(ctx context.Context, auth *Auth) (
 	return resp.StatusCode, strings.TrimSpace(string(body)), nil
 }
 
-// supportsAuthHealthProbeLocal 决定某个 auth 当前是否支持本地健康复检。
-// 主流程只依赖这个统一入口，不关心具体是哪个提供方。
+// supportsAuthHealthProbeLocal 鍐冲畾鏌愪釜 auth 褰撳墠鏄惁鏀寔鏈湴鍋ュ悍澶嶆銆?
+// 涓绘祦绋嬪彧渚濊禆杩欎釜缁熶竴鍏ュ彛锛屼笉鍏冲績鍏蜂綋鏄摢涓彁渚涙柟銆?
 func supportsAuthHealthProbeLocal(auth *Auth) bool {
 	if auth == nil {
 		return false
 	}
-	// 只复检状态 1 和 3；
-	// 状态 2 已经是失活账号，不再继续探测。
+	// 鍙妫€鐘舵€?1 鍜?3锛?
+	// 鐘舵€?2 宸茬粡鏄け娲昏处鍙凤紝涓嶅啀缁х画鎺㈡祴銆?
 	switch DBStatusForAuth(auth) {
 	case DBStatusDisabled:
 		return false
 	}
 	if isAPIKeyAuth(auth) {
-		// 这里的测活规则只针对 OAuth 账号，API key 不走这条 wham/usage 复检链路。
+		// 杩欓噷鐨勬祴娲昏鍒欏彧閽堝 OAuth 璐﹀彿锛孉PI key 涓嶈蛋杩欐潯 wham/usage 澶嶆閾捐矾銆?
 		return false
 	}
 	_, ok := authHealthProbeSpecForAuthLocal(auth)
 	return ok
 }
 
-// authHealthProbeSpecForAuthLocal 是多提供方扩展点。
-// 当前框架已经支持按 provider 分流，但第一版只挂接了 codex。
-// 后面要新增其他提供方时，在这里补一个分支即可。
+// authHealthProbeSpecForAuthLocal 鏄鎻愪緵鏂规墿灞曠偣銆?
+// 褰撳墠妗嗘灦宸茬粡鏀寔鎸?provider 鍒嗘祦锛屼絾绗竴鐗堝彧鎸傛帴浜?codex銆?
+// 鍚庨潰瑕佹柊澧炲叾浠栨彁渚涙柟鏃讹紝鍦ㄨ繖閲岃ˉ涓€涓垎鏀嵆鍙€?
 func authHealthProbeSpecForAuthLocal(auth *Auth) (*authHealthProbeSpecLocal, bool) {
 	if auth == nil {
 		return nil, false
@@ -2495,8 +2767,8 @@ func authHealthProbeSpecForAuthLocal(auth *Auth) (*authHealthProbeSpecLocal, boo
 	}
 }
 
-// codexAuthHealthProbeSpecLocal 生成 codex 提供方使用的本地健康复检 spec。
-// 这里先把 codex 的探测规则独立出来，后续新增其它 provider 时可以照这个结构继续补。
+// codexAuthHealthProbeSpecLocal 鐢熸垚 codex 鎻愪緵鏂逛娇鐢ㄧ殑鏈湴鍋ュ悍澶嶆 spec銆?
+// 杩欓噷鍏堟妸 codex 鐨勬帰娴嬭鍒欑嫭绔嬪嚭鏉ワ紝鍚庣画鏂板鍏跺畠 provider 鏃跺彲浠ョ収杩欎釜缁撴瀯缁х画琛ャ€?
 func codexAuthHealthProbeSpecLocal(auth *Auth) (*authHealthProbeSpecLocal, bool) {
 	if auth == nil {
 		return nil, false
@@ -2519,18 +2791,18 @@ func codexAuthHealthProbeSpecLocal(auth *Auth) (*authHealthProbeSpecLocal, bool)
 		"Accept":     {"application/json"},
 		"User-Agent": {codexHealthProbeUserAgent},
 	}
-	// 尽量把账号标识一起带上，确保测活打到的就是这条账号自己的上下文。
+	// 灏介噺鎶婅处鍙锋爣璇嗕竴璧峰甫涓婏紝纭繚娴嬫椿鎵撳埌鐨勫氨鏄繖鏉¤处鍙疯嚜宸辩殑涓婁笅鏂囥€?
 	if auth.Metadata != nil {
 		if accountID, ok := auth.Metadata["account_id"].(string); ok {
 			if trimmed := strings.TrimSpace(accountID); trimmed != "" {
-				// 优先使用登录时拿到的 account_id，保证测活命中的就是这条账号自己的 usage。
+				// 浼樺厛浣跨敤鐧诲綍鏃舵嬁鍒扮殑 account_id锛屼繚璇佹祴娲诲懡涓殑灏辨槸杩欐潯璐﹀彿鑷繁鐨?usage銆?
 				headers.Set("Chatgpt-Account-Id", trimmed)
 			}
 		}
 	}
 	if len(headers.Values("Chatgpt-Account-Id")) == 0 && auth.Attributes != nil {
 		if accountID := strings.TrimSpace(auth.Attributes["account_id"]); accountID != "" {
-			// 某些来源可能把 account_id 放在 Attributes，这里做一次兜底。
+			// 鏌愪簺鏉ユ簮鍙兘鎶?account_id 鏀惧湪 Attributes锛岃繖閲屽仛涓€娆″厹搴曘€?
 			headers.Set("Chatgpt-Account-Id", accountID)
 		}
 	}
@@ -2541,9 +2813,9 @@ func codexAuthHealthProbeSpecLocal(auth *Auth) (*authHealthProbeSpecLocal, bool)
 	}, true
 }
 
-// decodePossibleJSONPayloadLocal 尝试把可能是 JSON 字符串的 payload 拆解成结构化对象。
-// 有些字段本身是字符串但里面又包了一层 JSON，统一拆开后，后续递归提取失败信号
-// 就可以按同一套结构处理。
+// decodePossibleJSONPayloadLocal 灏濊瘯鎶婂彲鑳芥槸 JSON 瀛楃涓茬殑 payload 鎷嗚В鎴愮粨鏋勫寲瀵硅薄銆?
+// 鏈変簺瀛楁鏈韩鏄瓧绗︿覆浣嗛噷闈㈠張鍖呬簡涓€灞?JSON锛岀粺涓€鎷嗗紑鍚庯紝鍚庣画閫掑綊鎻愬彇澶辫触淇″彿
+// 灏卞彲浠ユ寜鍚屼竴濂楃粨鏋勫鐞嗐€?
 func decodePossibleJSONPayloadLocal(payload any) any {
 	switch typed := payload.(type) {
 	case nil:
@@ -2555,7 +2827,7 @@ func decodePossibleJSONPayloadLocal(payload any) any {
 		}
 		var decoded any
 		if json.Valid([]byte(trimmed)) && json.Unmarshal([]byte(trimmed), &decoded) == nil {
-			// 能成功拆成 JSON 时，后面就可以继续递归往里挖失败信号。
+			// 鑳芥垚鍔熸媶鎴?JSON 鏃讹紝鍚庨潰灏卞彲浠ョ户缁€掑綊寰€閲屾寲澶辫触淇″彿銆?
 			return decoded
 		}
 		return trimmed
@@ -2566,11 +2838,11 @@ func decodePossibleJSONPayloadLocal(payload any) any {
 	}
 }
 
-// extractCliproxyFailureReasonLocal 从测活响应中递归提取失败原因。
-// 提取顺序与外部脚本保持一致：error -> rate_limit/code_review_rate_limit -> additional_rate_limits -> 嵌套字段 -> 关键词兜底。
+// extractCliproxyFailureReasonLocal 浠庢祴娲诲搷搴斾腑閫掑綊鎻愬彇澶辫触鍘熷洜銆?
+// 鎻愬彇椤哄簭涓庡閮ㄨ剼鏈繚鎸佷竴鑷达細error -> rate_limit/code_review_rate_limit -> additional_rate_limits -> 宓屽瀛楁 -> 鍏抽敭璇嶅厹搴曘€?
 func extractCliproxyFailureReasonLocal(payload any, minRemainingWeeklyPercent int) *authHealthProbeFailureLocal {
-	// 按外部脚本的顺序提取失败原因：
-	// error -> rate_limit/code_review_rate_limit -> additional_rate_limits -> 嵌套字段 -> 关键词兜底。
+	// 鎸夊閮ㄨ剼鏈殑椤哄簭鎻愬彇澶辫触鍘熷洜锛?
+	// error -> rate_limit/code_review_rate_limit -> additional_rate_limits -> 宓屽瀛楁 -> 鍏抽敭璇嶅厹搴曘€?
 	data := decodePossibleJSONPayloadLocal(payload)
 	switch typed := data.(type) {
 	case string:
@@ -2578,7 +2850,7 @@ func extractCliproxyFailureReasonLocal(payload any, minRemainingWeeklyPercent in
 		if !ok {
 			return nil
 		}
-		// 纯字符串场景直接按关键词匹配，和外部脚本保持一致。
+		// 绾瓧绗︿覆鍦烘櫙鐩存帴鎸夊叧閿瘝鍖归厤锛屽拰澶栭儴鑴氭湰淇濇寔涓€鑷淬€?
 		return &authHealthProbeFailureLocal{
 			Reason:       formatKnownCliproxyErrorLocal(keyword),
 			QuotaLimited: isCliproxyQuotaKeywordLocal(keyword),
@@ -2587,7 +2859,7 @@ func extractCliproxyFailureReasonLocal(payload any, minRemainingWeeklyPercent in
 		errorValue, _ := typed["error"].(map[string]any)
 		if errorValue != nil {
 			if errType, okType := stringValueFromAnyLocal(errorValue["type"]); okType && strings.TrimSpace(errType) != "" {
-				// error.type 是最强信号，命中后直接返回，不再继续往下找。
+				// error.type 鏄渶寮轰俊鍙凤紝鍛戒腑鍚庣洿鎺ヨ繑鍥烇紝涓嶅啀缁х画寰€涓嬫壘銆?
 				return &authHealthProbeFailureLocal{
 					Reason:       formatKnownCliproxyErrorLocal(strings.TrimSpace(errType)),
 					QuotaLimited: isCliproxyQuotaKeywordLocal(strings.TrimSpace(errType)),
@@ -2595,7 +2867,7 @@ func extractCliproxyFailureReasonLocal(payload any, minRemainingWeeklyPercent in
 			}
 			if errMessage, okMessage := stringValueFromAnyLocal(errorValue["message"]); okMessage && strings.TrimSpace(errMessage) != "" {
 				keyword, foundKeyword := knownCliproxyKeywordLocal(errMessage)
-				// error.message 没有结构化类型时，至少把原文保留下来，方便后续定位。
+				// error.message 娌℃湁缁撴瀯鍖栫被鍨嬫椂锛岃嚦灏戞妸鍘熸枃淇濈暀涓嬫潵锛屾柟渚垮悗缁畾浣嶃€?
 				return &authHealthProbeFailureLocal{
 					Reason:       strings.TrimSpace(errMessage),
 					QuotaLimited: foundKeyword && isCliproxyQuotaKeywordLocal(keyword),
@@ -2617,14 +2889,14 @@ func extractCliproxyFailureReasonLocal(payload any, minRemainingWeeklyPercent in
 		case []any:
 			for idx, rateInfo := range additional {
 				key := "additional_rate_limits[" + strconv.Itoa(idx) + "]"
-				// 额外限额也是失效信号的一部分，逐项递归检查。
+				// 棰濆闄愰涔熸槸澶辨晥淇″彿鐨勪竴閮ㄥ垎锛岄€愰」閫掑綊妫€鏌ャ€?
 				if failure := extractRateLimitReasonLocal(rateInfo, key, 0); failure != nil {
 					return failure
 				}
 			}
 		case map[string]any:
 			for key, rateInfo := range additional {
-				// 有些返回是对象形式，这里也要一并覆盖掉。
+				// 鏈変簺杩斿洖鏄璞″舰寮忥紝杩欓噷涔熻涓€骞惰鐩栨帀銆?
 				if failure := extractRateLimitReasonLocal(rateInfo, "additional_rate_limits."+key, 0); failure != nil {
 					return failure
 				}
@@ -2633,14 +2905,14 @@ func extractCliproxyFailureReasonLocal(payload any, minRemainingWeeklyPercent in
 
 		for _, key := range []string{"data", "body", "response", "text", "content", "status_message"} {
 			if failure := extractCliproxyFailureReasonLocal(typed[key], minRemainingWeeklyPercent); failure != nil {
-				// 失败信息可能藏在嵌套字段里，这里递归挖出来。
+				// 澶辫触淇℃伅鍙兘钘忓湪宓屽瀛楁閲岋紝杩欓噷閫掑綊鎸栧嚭鏉ャ€?
 				return failure
 			}
 		}
 
 		if encoded, errMarshal := json.Marshal(typed); errMarshal == nil {
 			if keyword, okKeyword := knownCliproxyKeywordLocal(string(encoded)); okKeyword {
-				// 前面都没命中时，再做一次全文关键词兜底。
+				// 鍓嶉潰閮芥病鍛戒腑鏃讹紝鍐嶅仛涓€娆″叏鏂囧叧閿瘝鍏滃簳銆?
 				return &authHealthProbeFailureLocal{
 					Reason:       formatKnownCliproxyErrorLocal(keyword),
 					QuotaLimited: isCliproxyQuotaKeywordLocal(keyword),
@@ -2651,11 +2923,11 @@ func extractCliproxyFailureReasonLocal(payload any, minRemainingWeeklyPercent in
 	return nil
 }
 
-// extractRateLimitReasonLocal 从 rate_limit 对象中提取额度不足的具体原因。
+// extractRateLimitReasonLocal 浠?rate_limit 瀵硅薄涓彁鍙栭搴︿笉瓒崇殑鍏蜂綋鍘熷洜銆?
 func extractRateLimitReasonLocal(rateInfo any, key string, minRemainingWeeklyPercent int) *authHealthProbeFailureLocal {
-	// 额度不足的判断分两类：
-	// 1. allowed=false 或 limit_reached=true
-	// 2. 周额度剩余比例低于阈值（这里固定为 20%）
+	// 棰濆害涓嶈冻鐨勫垽鏂垎涓ょ被锛?
+	// 1. allowed=false 鎴?limit_reached=true
+	// 2. 鍛ㄩ搴﹀墿浣欐瘮渚嬩綆浜庨槇鍊硷紙杩欓噷鍥哄畾涓?20%锛?
 	data, ok := decodePossibleJSONPayloadLocal(rateInfo).(map[string]any)
 	if !ok {
 		return nil
@@ -2663,7 +2935,7 @@ func extractRateLimitReasonLocal(rateInfo any, key string, minRemainingWeeklyPer
 	allowed, hasAllowed := boolValueFromAnyLocal(data["allowed"])
 	limitReached, hasLimitReached := boolValueFromAnyLocal(data["limit_reached"])
 	if (hasAllowed && !allowed) || (hasLimitReached && limitReached) {
-		// 一旦明确提示不允许继续用，直接视为额度不足，不再往下看百分比。
+		// 涓€鏃︽槑纭彁绀轰笉鍏佽缁х画鐢紝鐩存帴瑙嗕负棰濆害涓嶈冻锛屼笉鍐嶅線涓嬬湅鐧惧垎姣斻€?
 		label := key + " exhausted"
 		switch key {
 		case "rate_limit":
@@ -2691,7 +2963,7 @@ func extractRateLimitReasonLocal(rateInfo any, key string, minRemainingWeeklyPer
 	}
 	if key == "rate_limit" && minRemainingWeeklyPercent > 0 {
 		if remainingPercent, okRemaining := extractRemainingPercentLocal(data["primary_window"]); okRemaining && remainingPercent < float64(minRemainingWeeklyPercent) {
-			// 这里实现你的自定义规则：低于 20% 就进入状态 3。
+			// 杩欓噷瀹炵幇浣犵殑鑷畾涔夎鍒欙細浣庝簬 20% 灏辫繘鍏ョ姸鎬?3銆?
 			return &authHealthProbeFailureLocal{
 				Reason:       "weekly quota remaining " + formatPercentLocal(remainingPercent) + "% is below " + strconv.Itoa(minRemainingWeeklyPercent) + "%",
 				QuotaLimited: true,
@@ -2701,25 +2973,25 @@ func extractRateLimitReasonLocal(rateInfo any, key string, minRemainingWeeklyPer
 	return nil
 }
 
-// extractRemainingPercentLocal 从 primary_window 中提取剩余额度百分比，兼容 remaining_percent 和 used_percent 两种格式。
+// extractRemainingPercentLocal 浠?primary_window 涓彁鍙栧墿浣欓搴︾櫨鍒嗘瘮锛屽吋瀹?remaining_percent 鍜?used_percent 涓ょ鏍煎紡銆?
 func extractRemainingPercentLocal(payload any) (float64, bool) {
-	// 同时兼容 remaining_percent 和 used_percent 两种格式。
+	// 鍚屾椂鍏煎 remaining_percent 鍜?used_percent 涓ょ鏍煎紡銆?
 	data, ok := decodePossibleJSONPayloadLocal(payload).(map[string]any)
 	if !ok {
 		return 0, false
 	}
 	if remainingPercent, okRemaining := floatValueFromAnyLocal(data["remaining_percent"]); okRemaining {
-		// 直接给了 remaining_percent 时，优先使用它。
+		// 鐩存帴缁欎簡 remaining_percent 鏃讹紝浼樺厛浣跨敤瀹冦€?
 		return clampPercentLocal(remainingPercent), true
 	}
 	if usedPercent, okUsed := floatValueFromAnyLocal(data["used_percent"]); okUsed {
-		// 只给 used_percent 时，换算成剩余百分比再参与判断。
+		// 鍙粰 used_percent 鏃讹紝鎹㈢畻鎴愬墿浣欑櫨鍒嗘瘮鍐嶅弬涓庡垽鏂€?
 		return clampPercentLocal(100 - usedPercent), true
 	}
 	return 0, false
 }
 
-// clampPercentLocal 把百分比值限制在 0-100 范围内。
+// clampPercentLocal 鎶婄櫨鍒嗘瘮鍊奸檺鍒跺湪 0-100 鑼冨洿鍐呫€?
 func clampPercentLocal(value float64) float64 {
 	if value < 0 {
 		return 0
@@ -2730,7 +3002,7 @@ func clampPercentLocal(value float64) float64 {
 	return value
 }
 
-// formatPercentLocal 格式化百分比为可读字符串，去掉尾部多余的 0。
+// formatPercentLocal 鏍煎紡鍖栫櫨鍒嗘瘮涓哄彲璇诲瓧绗︿覆锛屽幓鎺夊熬閮ㄥ浣欑殑 0銆?
 func formatPercentLocal(value float64) string {
 	rounded := strconv.FormatFloat(value, 'f', 2, 64)
 	rounded = strings.TrimRight(strings.TrimRight(rounded, "0"), ".")
@@ -2740,7 +3012,7 @@ func formatPercentLocal(value float64) string {
 	return rounded
 }
 
-// knownCliproxyKeywordLocal 检查字符串是否包含已知的失败关键词（如 usage_limit_reached、account_deactivated 等）。
+// knownCliproxyKeywordLocal 妫€鏌ュ瓧绗︿覆鏄惁鍖呭惈宸茬煡鐨勫け璐ュ叧閿瘝锛堝 usage_limit_reached銆乤ccount_deactivated 绛夛級銆?
 func knownCliproxyKeywordLocal(value string) (string, bool) {
 	value = strings.ToLower(value)
 	for _, keyword := range []string{"usage_limit_reached", "account_deactivated", "insufficient_quota", "invalid_api_key", "unsupported_region"} {
@@ -2751,7 +3023,7 @@ func knownCliproxyKeywordLocal(value string) (string, bool) {
 	return "", false
 }
 
-// isCliproxyQuotaKeywordLocal 判断关键词是否属于额度类问题（usage_limit_reached、insufficient_quota）。
+// isCliproxyQuotaKeywordLocal 鍒ゆ柇鍏抽敭璇嶆槸鍚﹀睘浜庨搴︾被闂锛坲sage_limit_reached銆乮nsufficient_quota锛夈€?
 func isCliproxyQuotaKeywordLocal(keyword string) bool {
 	switch strings.TrimSpace(keyword) {
 	case "usage_limit_reached", "insufficient_quota":
@@ -2761,9 +3033,9 @@ func isCliproxyQuotaKeywordLocal(keyword string) bool {
 	}
 }
 
-// formatKnownCliproxyErrorLocal 把已知错误关键词格式化为可读的错误描述，便于写库和排查。
+// formatKnownCliproxyErrorLocal 鎶婂凡鐭ラ敊璇叧閿瘝鏍煎紡鍖栦负鍙鐨勯敊璇弿杩帮紝渚夸簬鍐欏簱鍜屾帓鏌ャ€?
 func formatKnownCliproxyErrorLocal(keyword string) string {
-	// 给常见错误类型补充更好读的说明，便于写库和排查。
+	// 缁欏父瑙侀敊璇被鍨嬭ˉ鍏呮洿濂借鐨勮鏄庯紝渚夸簬鍐欏簱鍜屾帓鏌ャ€?
 	switch strings.TrimSpace(keyword) {
 	case "usage_limit_reached":
 		return "quota exhausted (usage_limit_reached)"
@@ -2780,7 +3052,7 @@ func formatKnownCliproxyErrorLocal(keyword string) string {
 	}
 }
 
-// stringValueFromAnyLocal 从任意类型值中提取字符串（支持 string、json.Number）。
+// stringValueFromAnyLocal 浠庝换鎰忕被鍨嬪€间腑鎻愬彇瀛楃涓诧紙鏀寔 string銆乯son.Number锛夈€?
 func stringValueFromAnyLocal(value any) (string, bool) {
 	switch typed := value.(type) {
 	case string:
@@ -2791,7 +3063,7 @@ func stringValueFromAnyLocal(value any) (string, bool) {
 	return "", false
 }
 
-// boolValueFromAnyLocal 从任意类型值中提取布尔值（支持 bool、string、json.Number、float64）。
+// boolValueFromAnyLocal 浠庝换鎰忕被鍨嬪€间腑鎻愬彇甯冨皵鍊硷紙鏀寔 bool銆乻tring銆乯son.Number銆乫loat64锛夈€?
 func boolValueFromAnyLocal(value any) (bool, bool) {
 	switch typed := value.(type) {
 	case bool:
@@ -2812,7 +3084,7 @@ func boolValueFromAnyLocal(value any) (bool, bool) {
 	return false, false
 }
 
-// floatValueFromAnyLocal 从任意类型值中提取浮点数（支持 float32/64、int、int64、json.Number、string）。
+// floatValueFromAnyLocal 浠庝换鎰忕被鍨嬪€间腑鎻愬彇娴偣鏁帮紙鏀寔 float32/64銆乮nt銆乮nt64銆乯son.Number銆乻tring锛夈€?
 func floatValueFromAnyLocal(value any) (float64, bool) {
 	switch typed := value.(type) {
 	case float64:
@@ -2837,7 +3109,7 @@ func floatValueFromAnyLocal(value any) (float64, bool) {
 	return 0, false
 }
 
-// intValueFromAnyLocal 从任意类型值中提取整数（支持 int、int32、int64、float64、json.Number、string）。
+// intValueFromAnyLocal 浠庝换鎰忕被鍨嬪€间腑鎻愬彇鏁存暟锛堟敮鎸?int銆乮nt32銆乮nt64銆乫loat64銆乯son.Number銆乻tring锛夈€?
 func intValueFromAnyLocal(value any) (int, bool) {
 	switch typed := value.(type) {
 	case int:
@@ -2862,8 +3134,8 @@ func intValueFromAnyLocal(value any) (int, bool) {
 	return 0, false
 }
 
-// healthProbeFailureReasonLocal 把测活失败的原因格式化为 JSON 字符串，供落库和展示。
-// 如果响应体已经是合法 JSON 则原样返回；否则用 status+detail+message 包一层 JSON 结构。
+// healthProbeFailureReasonLocal 鎶婃祴娲诲け璐ョ殑鍘熷洜鏍煎紡鍖栦负 JSON 瀛楃涓诧紝渚涜惤搴撳拰灞曠ず銆?
+// 濡傛灉鍝嶅簲浣撳凡缁忔槸鍚堟硶 JSON 鍒欏師鏍疯繑鍥烇紱鍚﹀垯鐢?status+detail+message 鍖呬竴灞?JSON 缁撴瀯銆?
 func healthProbeFailureReasonLocal(status int, body string) string {
 	body = strings.TrimSpace(body)
 	if body != "" && json.Valid([]byte(body)) {
@@ -2890,7 +3162,7 @@ func healthProbeFailureReasonLocal(status int, body string) string {
 	return string(encoded)
 }
 
-// unauthorizedHealthProbeReasonLocal 生成 401 专用的测活失败原因。
+// unauthorizedHealthProbeReasonLocal 鐢熸垚 401 涓撶敤鐨勬祴娲诲け璐ュ師鍥犮€?
 func unauthorizedHealthProbeReasonLocal(body string) string {
 	return healthProbeFailureReasonLocal(http.StatusUnauthorized, body)
 }
@@ -2923,8 +3195,28 @@ func resetModelState(state *ModelState, now time.Time) {
 	state.UpdatedAt = now
 }
 
+func modelStateIsClean(state *ModelState) bool {
+	if state == nil {
+		return true
+	}
+	if state.Status != StatusActive {
+		return false
+	}
+	if state.Unavailable || state.StatusMessage != "" || !state.NextRetryAfter.IsZero() || state.LastError != nil {
+		return false
+	}
+	if state.Quota.Exceeded || state.Quota.Reason != "" || !state.Quota.NextRecoverAt.IsZero() || state.Quota.BackoffLevel != 0 {
+		return false
+	}
+	return true
+}
+
 func updateAggregatedAvailability(auth *Auth, now time.Time) {
-	if auth == nil || len(auth.ModelStates) == 0 {
+	if auth == nil {
+		return
+	}
+	if len(auth.ModelStates) == 0 {
+		clearAggregatedAvailability(auth)
 		return
 	}
 	allUnavailable := true
@@ -2932,10 +3224,12 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 	quotaExceeded := false
 	quotaRecover := time.Time{}
 	maxBackoffLevel := 0
+	hasState := false
 	for _, state := range auth.ModelStates {
 		if state == nil {
 			continue
 		}
+		hasState = true
 		stateUnavailable := false
 		if state.Status == StatusDisabled {
 			stateUnavailable = true
@@ -2965,6 +3259,10 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 			}
 		}
 	}
+	if !hasState {
+		clearAggregatedAvailability(auth)
+		return
+	}
 	auth.Unavailable = allUnavailable
 	if allUnavailable {
 		auth.NextRetryAfter = earliestRetry
@@ -2982,6 +3280,15 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 		auth.Quota.NextRecoverAt = time.Time{}
 		auth.Quota.BackoffLevel = 0
 	}
+}
+
+func clearAggregatedAvailability(auth *Auth) {
+	if auth == nil {
+		return
+	}
+	auth.Unavailable = false
+	auth.NextRetryAfter = time.Time{}
+	auth.Quota = QuotaState{}
 }
 
 func hasModelError(auth *Auth, now time.Time) bool {
@@ -3168,6 +3475,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	if isRequestScopedNotFoundResultError(resultErr) {
 		return
 	}
+	disableCooling := quotaCooldownDisabledForAuth(auth)
 	auth.Unavailable = true
 	auth.Status = StatusError
 	auth.UpdatedAt = now
@@ -3181,32 +3489,46 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	switch statusCode {
 	case 401:
 		auth.StatusMessage = "unauthorized"
-		auth.NextRetryAfter = now.Add(30 * time.Minute)
+		if disableCooling {
+			auth.NextRetryAfter = time.Time{}
+		} else {
+			auth.NextRetryAfter = now.Add(30 * time.Minute)
+		}
 	case 402, 403:
 		auth.StatusMessage = "payment_required"
-		auth.NextRetryAfter = now.Add(30 * time.Minute)
+		if disableCooling {
+			auth.NextRetryAfter = time.Time{}
+		} else {
+			auth.NextRetryAfter = now.Add(30 * time.Minute)
+		}
 	case 404:
 		auth.StatusMessage = "not_found"
-		auth.NextRetryAfter = now.Add(12 * time.Hour)
+		if disableCooling {
+			auth.NextRetryAfter = time.Time{}
+		} else {
+			auth.NextRetryAfter = now.Add(12 * time.Hour)
+		}
 	case 429:
 		auth.StatusMessage = "quota exhausted"
 		auth.Quota.Exceeded = true
 		auth.Quota.Reason = "quota"
 		var next time.Time
-		if retryAfter != nil {
-			next = now.Add(*retryAfter)
-		} else {
-			cooldown, nextLevel := nextQuotaCooldown(auth.Quota.BackoffLevel, quotaCooldownDisabledForAuth(auth))
-			if cooldown > 0 {
-				next = now.Add(cooldown)
+		if !disableCooling {
+			if retryAfter != nil {
+				next = now.Add(*retryAfter)
+			} else {
+				cooldown, nextLevel := nextQuotaCooldown(auth.Quota.BackoffLevel, disableCooling)
+				if cooldown > 0 {
+					next = now.Add(cooldown)
+				}
+				auth.Quota.BackoffLevel = nextLevel
 			}
-			auth.Quota.BackoffLevel = nextLevel
 		}
 		auth.Quota.NextRecoverAt = next
 		auth.NextRetryAfter = next
 	case 408, 500, 502, 503, 504:
 		auth.StatusMessage = "transient upstream error"
-		if quotaCooldownDisabledForAuth(auth) {
+		if disableCooling {
 			auth.NextRetryAfter = time.Time{}
 		} else {
 			auth.NextRetryAfter = now.Add(1 * time.Minute)
@@ -3218,28 +3540,28 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	}
 }
 
-// autoDisableReason 用来判断这次失败是否应该触发“自动停用”。
-// 当前规则很简单：外层状态码是 401，且错误内容里也能解析出 status=401，就认为应该自动停用。
+// autoDisableReason 鐢ㄦ潵鍒ゆ柇杩欐澶辫触鏄惁搴旇瑙﹀彂鈥滆嚜鍔ㄥ仠鐢ㄢ€濄€?
+// 褰撳墠瑙勫垯寰堢畝鍗曪細澶栧眰鐘舵€佺爜鏄?401锛屼笖閿欒鍐呭閲屼篃鑳借В鏋愬嚭 status=401锛屽氨璁や负搴旇鑷姩鍋滅敤銆?
 func autoDisableReason(resultErr *Error) (string, bool) {
-	// 先挡掉非 401 场景，避免把其他错误误判成需要停用。
+	// 鍏堟尅鎺夐潪 401 鍦烘櫙锛岄伩鍏嶆妸鍏朵粬閿欒璇垽鎴愰渶瑕佸仠鐢ㄣ€?
 	if resultErr == nil {
 		return "", false
 	}
 
-	// 原始错误内容后面还要用于状态记录和展示，所以这里先做一次去空白处理。
+	// 鍘熷閿欒鍐呭鍚庨潰杩樿鐢ㄤ簬鐘舵€佽褰曞拰灞曠ず锛屾墍浠ヨ繖閲屽厛鍋氫竴娆″幓绌虹櫧澶勭悊銆?
 	raw := strings.TrimSpace(resultErr.Message)
 	if raw == "" {
 		return "", false
 	}
 
-	// 这里只关心返回体里的 status 字段，不再看其他错误码或文案。
+	// 杩欓噷鍙叧蹇冭繑鍥炰綋閲岀殑 status 瀛楁锛屼笉鍐嶇湅鍏朵粬閿欒鐮佹垨鏂囨銆?
 	type providerErrorEnvelope struct {
 		Status int    `json:"status"`
 		Detail string `json:"detail"`
 	}
 
 	var parsed providerErrorEnvelope
-	// 只有当错误内容是合法 JSON，并且里面的 status 也是 401，才真正触发自动停用。
+	// 鍙湁褰撻敊璇唴瀹规槸鍚堟硶 JSON锛屽苟涓旈噷闈㈢殑 status 涔熸槸 401锛屾墠鐪熸瑙﹀彂鑷姩鍋滅敤銆?
 	if !json.Valid([]byte(raw)) || json.Unmarshal([]byte(raw), &parsed) != nil {
 		return "", false
 	}
@@ -3253,17 +3575,17 @@ func autoDisableReason(resultErr *Error) (string, bool) {
 	return "", false
 }
 
-// disableAuthForPermanentFailure 负责把一个已经确认永久失效的 auth
-// 切换成禁用状态，并清掉所有“它还可以稍后再试”的痕迹。
+// disableAuthForPermanentFailure 璐熻矗鎶婁竴涓凡缁忕‘璁ゆ案涔呭け鏁堢殑 auth
+// 鍒囨崲鎴愮鐢ㄧ姸鎬侊紝骞舵竻鎺夋墍鏈夆€滃畠杩樺彲浠ョ◢鍚庡啀璇曗€濈殑鐥曡抗銆?
 func disableAuthForPermanentFailure(auth *Auth, result Result, reason string, now time.Time) {
 	if auth == nil {
 		return
 	}
 	statusMessage := FormatAutoDisabledStatusMessage(reason, now)
-	// 先处理 auth 级别状态：
-	// - Disabled=true 表示这个 auth 已明确不可再用
-	// - Unavailable=false 表示它不是“暂时不可用”，而是“已经下线”
-	// - NextRetryAfter/Quota 清空，避免它继续走重试和限额恢复逻辑
+	// 鍏堝鐞?auth 绾у埆鐘舵€侊細
+	// - Disabled=true 琛ㄧず杩欎釜 auth 宸叉槑纭笉鍙啀鐢?
+	// - Unavailable=false 琛ㄧず瀹冧笉鏄€滄殏鏃朵笉鍙敤鈥濓紝鑰屾槸鈥滃凡缁忎笅绾库€?
+	// - NextRetryAfter/Quota 娓呯┖锛岄伩鍏嶅畠缁х画璧伴噸璇曞拰闄愰鎭㈠閫昏緫
 	auth.Disabled = true
 	auth.Unavailable = false
 	auth.Status = StatusDisabled
@@ -3271,16 +3593,16 @@ func disableAuthForPermanentFailure(auth *Auth, result Result, reason string, no
 	auth.UpdatedAt = now
 	auth.NextRetryAfter = time.Time{}
 	auth.Quota = QuotaState{}
-	// LastError 继续保留原始错误串，后面数据库保存和前端展示都要用到它。
+	// LastError 缁х画淇濈暀鍘熷閿欒涓诧紝鍚庨潰鏁版嵁搴撲繚瀛樺拰鍓嶇灞曠ず閮借鐢ㄥ埌瀹冦€?
 	auth.LastError = disabledResultError(result.Error, reason)
 
 	if result.Model == "" {
-		// 如果这次失败不是某个具体模型触发的，到这里就够了。
+		// 濡傛灉杩欐澶辫触涓嶆槸鏌愪釜鍏蜂綋妯″瀷瑙﹀彂鐨勶紝鍒拌繖閲屽氨澶熶簡銆?
 		return
 	}
 	state := ensureModelState(auth, result.Model)
-	// 如果这次失败是某个具体模型触发的，
-	// 这里再把模型级状态也同步改成禁用，保证 auth 级和模型级显示一致。
+	// 濡傛灉杩欐澶辫触鏄煇涓叿浣撴ā鍨嬭Е鍙戠殑锛?
+	// 杩欓噷鍐嶆妸妯″瀷绾х姸鎬佷篃鍚屾鏀规垚绂佺敤锛屼繚璇?auth 绾у拰妯″瀷绾ф樉绀轰竴鑷淬€?
 	state.Status = StatusDisabled
 	state.StatusMessage = statusMessage
 	state.Unavailable = false
@@ -3292,12 +3614,12 @@ func disableAuthForPermanentFailure(auth *Auth, result Result, reason string, no
 
 func disabledResultError(resultErr *Error, reason string) *Error {
 	if resultErr == nil {
-		// 极端情况下如果拿不到上游错误对象，
-		// 就手动补一个兜底错误，避免后续落库和展示时拿不到原因。
+		// 鏋佺鎯呭喌涓嬪鏋滄嬁涓嶅埌涓婃父閿欒瀵硅薄锛?
+		// 灏辨墜鍔ㄨˉ涓€涓厹搴曢敊璇紝閬垮厤鍚庣画钀藉簱鍜屽睍绀烘椂鎷夸笉鍒板師鍥犮€?
 		return &Error{Code: "account_deactivated", Message: reason, HTTPStatus: http.StatusUnauthorized}
 	}
 	cloned := cloneError(resultErr)
-	// 尽量补齐错误码和状态码，保证后续状态展示、数据库记录更稳定。
+	// 灏介噺琛ラ綈閿欒鐮佸拰鐘舵€佺爜锛屼繚璇佸悗缁姸鎬佸睍绀恒€佹暟鎹簱璁板綍鏇寸ǔ瀹氥€?
 	if strings.TrimSpace(cloned.Code) == "" {
 		cloned.Code = "account_deactivated"
 	}
@@ -3420,6 +3742,13 @@ func shouldRetrySchedulerPick(err error) bool {
 	return authErr.Code == "auth_not_found" || authErr.Code == "auth_unavailable"
 }
 
+func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) bool {
+	if auth == nil || strings.TrimSpace(routeModel) == "" {
+		return false
+	}
+	return m.selectionModelKeyForAuth(auth, routeModel) != canonicalModelKey(routeModel)
+}
+
 func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 
@@ -3449,7 +3778,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if _, used := tried[candidate.ID]; used {
 			continue
 		}
-		if modelKey != "" && registryRef != nil && !registryRef.ClientSupportsModel(candidate.ID, modelKey) {
+		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
 		candidates = append(candidates, candidate)
@@ -3458,7 +3787,12 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		m.mu.RUnlock()
 		return nil, nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	selected, errPick := m.selector.Pick(ctx, provider, model, opts, candidates)
+	available, errAvailable := m.availableAuthsForRouteModel(candidates, provider, model, time.Now())
+	if errAvailable != nil {
+		m.mu.RUnlock()
+		return nil, nil, errAvailable
+	}
+	selected, errPick := m.selector.Pick(ctx, provider, selectionArgForSelector(m.selector, model), opts, available)
 	if errPick != nil {
 		m.mu.RUnlock()
 		return nil, nil, errPick
@@ -3483,6 +3817,22 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	if !m.useSchedulerFastPath() {
 		return m.pickNextLegacy(ctx, provider, model, opts, tried)
+	}
+	if strings.TrimSpace(model) != "" {
+		m.mu.RLock()
+		for _, candidate := range m.auths {
+			if candidate == nil || candidate.Provider != provider || candidate.Disabled {
+				continue
+			}
+			if _, used := tried[candidate.ID]; used {
+				continue
+			}
+			if m.routeAwareSelectionRequired(candidate, model) {
+				m.mu.RUnlock()
+				return m.pickNextLegacy(ctx, provider, model, opts, tried)
+			}
+		}
+		m.mu.RUnlock()
 	}
 	executor, okExecutor := m.Executor(provider)
 	if !okExecutor {
@@ -3557,7 +3907,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if _, ok := m.executors[providerKey]; !ok {
 			continue
 		}
-		if modelKey != "" && registryRef != nil && !registryRef.ClientSupportsModel(candidate.ID, modelKey) {
+		if modelKey != "" && !m.authSupportsRouteModel(registryRef, candidate, model) {
 			continue
 		}
 		candidates = append(candidates, candidate)
@@ -3566,7 +3916,12 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		m.mu.RUnlock()
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
-	selected, errPick := m.selector.Pick(ctx, "mixed", model, opts, candidates)
+	available, errAvailable := m.availableAuthsForRouteModel(candidates, "mixed", model, time.Now())
+	if errAvailable != nil {
+		m.mu.RUnlock()
+		return nil, nil, "", errAvailable
+	}
+	selected, errPick := m.selector.Pick(ctx, "mixed", selectionArgForSelector(m.selector, model), opts, available)
 	if errPick != nil {
 		m.mu.RUnlock()
 		return nil, nil, "", errPick
@@ -3617,6 +3972,29 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	}
 	if len(eligibleProviders) == 0 {
 		return nil, nil, "", &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+	if strings.TrimSpace(model) != "" {
+		providerSet := make(map[string]struct{}, len(eligibleProviders))
+		for _, providerKey := range eligibleProviders {
+			providerSet[providerKey] = struct{}{}
+		}
+		m.mu.RLock()
+		for _, candidate := range m.auths {
+			if candidate == nil || candidate.Disabled {
+				continue
+			}
+			if _, ok := providerSet[strings.TrimSpace(strings.ToLower(candidate.Provider))]; !ok {
+				continue
+			}
+			if _, used := tried[candidate.ID]; used {
+				continue
+			}
+			if m.routeAwareSelectionRequired(candidate, model) {
+				m.mu.RUnlock()
+				return m.pickNextMixedLegacy(ctx, providers, model, opts, tried)
+			}
+		}
+		m.mu.RUnlock()
 	}
 
 	selected, providerKey, errPick := m.scheduler.pickMixed(ctx, eligibleProviders, model, opts, tried)
@@ -3678,54 +4056,71 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 	if interval <= 0 {
 		interval = refreshCheckInterval
 	}
-	if m.refreshCancel != nil {
-		m.refreshCancel()
-		m.refreshCancel = nil
+
+	m.mu.Lock()
+	cancelPrev := m.refreshCancel
+	m.refreshCancel = nil
+	m.refreshLoop = nil
+	m.mu.Unlock()
+	if cancelPrev != nil {
+		cancelPrev()
 	}
-	ctx, cancel := context.WithCancel(parent)
-	m.refreshCancel = cancel
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		m.checkRefreshes(ctx)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				m.checkRefreshes(ctx)
-			}
-		}
-	}()
+
+	ctx, cancelCtx := context.WithCancel(parent)
+	workers := refreshMaxConcurrency
+	if cfg, ok := m.runtimeConfig.Load().(*internalconfig.Config); ok && cfg != nil && cfg.AuthAutoRefreshWorkers > 0 {
+		workers = cfg.AuthAutoRefreshWorkers
+	}
+	loop := newAuthAutoRefreshLoop(m, interval, workers)
+
+	m.mu.Lock()
+	m.refreshCancel = cancelCtx
+	m.refreshLoop = loop
+	m.mu.Unlock()
+
+	loop.rebuild(time.Now())
+	go loop.run(ctx)
 }
 
-// StartAutoRefreshLocal 保留原有自动刷新循环，并在本地版流程中额外加入
-// OAuth 健康定时巡检。
+// StartAutoRefreshLocal keeps the standard refresh loop and adds periodic
+// OAuth health probes used by local deployments.
 func (m *Manager) StartAutoRefreshLocal(parent context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = refreshCheckInterval
 	}
-	if m.refreshCancel != nil {
-		m.refreshCancel()
-		m.refreshCancel = nil
+
+	m.mu.Lock()
+	cancelPrev := m.refreshCancel
+	m.refreshCancel = nil
+	m.refreshLoop = nil
+	m.mu.Unlock()
+	if cancelPrev != nil {
+		cancelPrev()
 	}
-	ctx, cancel := context.WithCancel(parent)
-	m.refreshCancel = cancel
+
+	ctx, cancelCtx := context.WithCancel(parent)
+	workers := refreshMaxConcurrency
+	if cfg, ok := m.runtimeConfig.Load().(*internalconfig.Config); ok && cfg != nil && cfg.AuthAutoRefreshWorkers > 0 {
+		workers = cfg.AuthAutoRefreshWorkers
+	}
+	loop := newAuthAutoRefreshLoop(m, interval, workers)
+
+	m.mu.Lock()
+	m.refreshCancel = cancelCtx
+	m.refreshLoop = loop
+	m.mu.Unlock()
+
+	loop.rebuild(time.Now())
+	go loop.run(ctx)
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		// 启动时先跑一轮：既做原有 refresh，也做本地健康巡检。
-		m.checkRefreshes(ctx)
 		m.checkAuthHealthProbesLocal(ctx)
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				// 后续每个周期同时执行两件事：
-				// 1. 原有的 token 自动刷新；
-				// 2. 本地定时健康复检。
-				m.checkRefreshes(ctx)
 				m.checkAuthHealthProbesLocal(ctx)
 			}
 		}
@@ -3734,57 +4129,27 @@ func (m *Manager) StartAutoRefreshLocal(parent context.Context, interval time.Du
 
 // StopAutoRefresh cancels the background refresh loop, if running.
 func (m *Manager) StopAutoRefresh() {
-	if m.refreshCancel != nil {
-		m.refreshCancel()
-		m.refreshCancel = nil
+	m.mu.Lock()
+	cancel := m.refreshCancel
+	m.refreshCancel = nil
+	m.refreshLoop = nil
+	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
-func (m *Manager) checkRefreshes(ctx context.Context) {
-	// log.Debugf("checking refreshes")
-	now := time.Now()
-	snapshot := m.snapshotAuths()
-	for _, a := range snapshot {
-		typ, _ := a.AccountInfo()
-		if typ != "api_key" {
-			if !m.shouldRefresh(a, now) {
-				continue
-			}
-			log.Debugf("checking refresh for %s, %s, %s", a.Provider, a.ID, typ)
-
-			if exec := m.executorFor(a.Provider); exec == nil {
-				continue
-			}
-			if !m.markRefreshPending(a.ID, now) {
-				continue
-			}
-			go m.refreshAuthWithLimit(ctx, a.ID)
-		}
-	}
-}
-
-func (m *Manager) refreshAuthWithLimit(ctx context.Context, id string) {
-	if m.refreshSemaphore == nil {
-		m.refreshAuth(ctx, id)
+func (m *Manager) queueRefreshReschedule(authID string) {
+	if m == nil || authID == "" {
 		return
 	}
-	select {
-	case m.refreshSemaphore <- struct{}{}:
-		defer func() { <-m.refreshSemaphore }()
-	case <-ctx.Done():
-		return
-	}
-	m.refreshAuth(ctx, id)
-}
-
-func (m *Manager) snapshotAuths() []*Auth {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	out := make([]*Auth, 0, len(m.auths))
-	for _, a := range m.auths {
-		out = append(out, a.Clone())
+	loop := m.refreshLoop
+	m.mu.RUnlock()
+	if loop == nil {
+		return
 	}
-	return out
+	loop.queueReschedule(authID)
 }
 
 func (m *Manager) snapshotKnownAuths() []*Auth {
@@ -4007,16 +4372,20 @@ func lookupMetadataTime(meta map[string]any, keys ...string) (time.Time, bool) {
 
 func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	auth, ok := m.auths[id]
 	if !ok || auth == nil || auth.Disabled {
+		m.mu.Unlock()
 		return false
 	}
 	if !auth.NextRefreshAfter.IsZero() && now.Before(auth.NextRefreshAfter) {
+		m.mu.Unlock()
 		return false
 	}
 	auth.NextRefreshAfter = now.Add(refreshPendingBackoff)
 	m.auths[id] = auth
+	m.mu.Unlock()
+
+	m.queueRefreshReschedule(id)
 	return true
 }
 
@@ -4043,16 +4412,21 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {
+		shouldReschedule := false
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
 			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
 			current.LastError = &Error{Message: err.Error()}
 			m.auths[id] = current
+			shouldReschedule = true
 			if m.scheduler != nil {
 				m.scheduler.upsertAuth(current.Clone())
 			}
 		}
 		m.mu.Unlock()
+		if shouldReschedule {
+			m.queueRefreshReschedule(id)
+		}
 		return
 	}
 	if updated == nil {

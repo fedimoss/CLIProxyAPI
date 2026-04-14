@@ -80,5 +80,6 @@ func (s *Service) reconcileRuntimeAuthRegistration(auth *coreauth.Auth) {
 	// 账号恢复为可用后，重新补齐运行时依赖，并刷新调度器快照。
 	s.ensureExecutorsForAuth(auth)
 	s.registerModelsForAuth(auth)
+	s.coreManager.ReconcileRegistryModelStates(context.Background(), auth.ID)
 	s.coreManager.RefreshSchedulerEntry(auth.ID)
 }
