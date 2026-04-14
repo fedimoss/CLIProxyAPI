@@ -2345,7 +2345,7 @@ func (m *Manager) checkAuthHealthProbesLocal(ctx context.Context) {
 		pending = append(pending, auth)
 	}
 	if len(pending) > 0 {
-		log.Infof("澶嶆寮€濮嬩簡")
+		log.Infof("oauth health probe started")
 	}
 	for _, auth := range pending {
 		go m.runAuthHealthProbeWithLimitLocal(ctx, auth.ID)
@@ -2431,6 +2431,18 @@ func (m *Manager) runAuthHealthProbeLocal(parent context.Context, auth *Auth) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, healthProbeTimeout)
 	defer cancel()
+
+	// 状态 3（额度不足）的账号在 inactiveAuths 中，不参与自动刷新循环，
+	// OAuth token 可能已经过期。探针执行前先刷新 token，避免因 token 过期
+	// 被误判为账号失活（状态 2）。
+	if DBStatusForAuth(auth) == DBStatusQuotaLimited {
+		refreshCtx, refreshCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		refreshed, ok := m.refreshAuthForHealthProbe(refreshCtx, auth.ID)
+		refreshCancel()
+		if ok && refreshed != nil {
+			auth = refreshed
+		}
+	}
 
 	statusCode, body, errProbe := m.executeAuthHealthProbeLocal(ctx, auth)
 	if errProbe != nil {
@@ -4442,6 +4454,50 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	updated.LastError = nil
 	updated.UpdatedAt = now
 	_, _ = m.Update(ctx, updated)
+}
+
+// refreshAuthForHealthProbe 为可能在活跃池（auths）或非活跃池（inactiveAuths）中的
+// 账号刷新 OAuth token。用于额度不足（状态 3）的账号在健康探针前刷新 token，
+// 避免因 token 过期被误判为失活。
+// 刷新成功时返回更新后的 auth 快照；刷新失败时返回原始 auth，让探针继续执行。
+func (m *Manager) refreshAuthForHealthProbe(ctx context.Context, id string) (*Auth, bool) {
+	m.mu.RLock()
+	auth, ok := m.authByIDLocked(id)
+	var exec ProviderExecutor
+	if ok && auth != nil {
+		exec = m.executors[auth.Provider]
+	}
+	m.mu.RUnlock()
+
+	if auth == nil || exec == nil {
+		return nil, false
+	}
+
+	cloned := auth.Clone()
+	updated, err := exec.Refresh(ctx, cloned)
+	if err != nil {
+		log.Debugf("探针前刷新失败 %s %s: %v", auth.Provider, auth.ID, err)
+		// 返回原始 auth，探针会照常分类错误。
+		return auth.Clone(), true
+	}
+
+	if updated == nil {
+		updated = cloned
+	}
+	if updated.Runtime == nil {
+		updated.Runtime = auth.Runtime
+	}
+	now := time.Now()
+	updated.LastRefreshedAt = now
+	updated.NextRefreshAfter = time.Time{}
+	updated.LastError = nil
+	updated.UpdatedAt = now
+	// Update writes through storeAuthLocked (places the auth in the correct pool)
+	// and persists to the database.
+	_, _ = m.Update(ctx, updated)
+
+	fresh, ok := m.GetByID(id)
+	return fresh, ok
 }
 
 func (m *Manager) executorFor(provider string) ProviderExecutor {
