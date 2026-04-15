@@ -22,7 +22,6 @@ import (
 	geminiAuth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/gemini"
 	iflowauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/iflow"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/qwen"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/clioauth"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
@@ -39,8 +38,8 @@ const (
 	geminiCLIVersion  = "v1internal"
 )
 
-// providerToModelType 将提供商名称映射到 model_type 整数值。
-// 1: Codex 2: Anthropic 3: Qwen 4: Gemini 5: Antigravity 6: Kimi 7: IFlow
+// providerToModelType maps provider names to model_type values.
+// 1: Codex 2: Anthropic 4: Gemini 5: Antigravity 6: Kimi 7: IFlow
 func providerToModelType(provider string) int {
 	return clioauth.ProviderToModelType(provider)
 }
@@ -755,62 +754,6 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 			fmt.Printf("Using GCP project: %s\n", projectID)
 		}
 		fmt.Println("You can now use Antigravity services through this CLI")
-	}()
-
-	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
-}
-
-func (h *Handler) RequestQwenToken(c *gin.Context) {
-	ctx := context.Background()
-	ctx = PopulateAuthContext(ctx, c)
-
-	fmt.Println("Initializing Qwen authentication...")
-
-	state := fmt.Sprintf("gem-%d", time.Now().UnixNano())
-	// 初始化 Qwen 认证服务
-	qwenAuth := qwen.NewQwenAuth(h.cfg)
-
-	// 生成授权 URL
-	deviceFlow, err := qwenAuth.InitiateDeviceFlow(ctx)
-	if err != nil {
-		log.Errorf("Failed to generate authorization URL: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
-		return
-	}
-	authURL := deviceFlow.VerificationURIComplete
-
-	RegisterOAuthSession(state, "qwen")
-
-	go func() {
-		fmt.Println("Waiting for authentication...")
-		tokenData, errPollForToken := qwenAuth.PollForToken(deviceFlow.DeviceCode, deviceFlow.CodeVerifier)
-		if errPollForToken != nil {
-			SetOAuthSessionError(state, "Authentication failed")
-			fmt.Printf("Authentication failed: %v\n", errPollForToken)
-			return
-		}
-
-		// 创建令牌存储
-		tokenStorage := qwenAuth.CreateTokenStorage(tokenData)
-
-		tokenStorage.Email = fmt.Sprintf("%d", time.Now().UnixMilli())
-		record := &coreauth.Auth{
-			ID:       fmt.Sprintf("qwen-%s.json", tokenStorage.Email),
-			Provider: "qwen",
-			FileName: fmt.Sprintf("qwen-%s.json", tokenStorage.Email),
-			Storage:  tokenStorage,
-			Metadata: map[string]any{"email": tokenStorage.Email},
-		}
-		savedPath, errSave := h.saveTokenRecord(ctx, record)
-		if errSave != nil {
-			log.Errorf("Failed to save authentication tokens: %v", errSave)
-			SetOAuthSessionError(state, "Failed to save authentication tokens")
-			return
-		}
-
-		fmt.Printf("Authentication successful! Token saved to database, oauth_id=%s\n", savedPath)
-		fmt.Println("You can now use Qwen services through this CLI")
-		CompleteOAuthSession(state)
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
