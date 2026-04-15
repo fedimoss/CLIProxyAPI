@@ -20,7 +20,7 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// UserOAuthPinMiddleware 鏍规嵁 API key锛坈li_user_id锛夋煡璇㈠叧鑱旂殑 cli_oauth_id锛?// 闅忔満閫変竴涓敞鍏ュ埌 context 鐨?pinned auth ID锛屼娇 conductor 浣跨敤瀵瑰簲鐨?OAuth 鍑瘉銆?
+// UserOAuthPinMiddleware 为当前 CLI 用户固定一个 OAuth 凭据，并注入到请求上下文中。
 func UserOAuthPinMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		raw, exists := c.Get("apiKey")
@@ -39,7 +39,7 @@ func UserOAuthPinMiddleware() gin.HandlerFunc {
 			entry = entry.WithField("request_id", reqID)
 		}
 
-		// Infer provider(s) from the request payload model so we can prefer the matching model_type.
+		// 从请求体中的 model 字段推断 provider，以便优先匹配对应的 model_type。
 		rawModel, providers := extractProvidersFromRequest(c)
 		desiredModelTypes := modelTypesForProviders(providers)
 
@@ -61,7 +61,7 @@ func UserOAuthPinMiddleware() gin.HandlerFunc {
 		selected := pickCandidate(filtered)
 		selectedSource := "filtered"
 		if selected == nil {
-			// Fallback: keep legacy behavior (pick any associated oauth) so we don't break non-standard routes.
+			// 回退：保持旧有行为（选取任意关联的 OAuth），避免破坏非标准路由。
 			selected = pickCandidate(candidates)
 			selectedSource = "fallback_any"
 			if log.IsLevelEnabled(log.DebugLevel) {
@@ -77,7 +77,7 @@ func UserOAuthPinMiddleware() gin.HandlerFunc {
 			entry.Debugf("user oauth pin: selected cli_oauth_id=%s (source=%s cli_user_id=%s model=%q providers=%v model_type=%d candidates=%d)", selected.CliOauthId, selectedSource, util.HideAPIKey(cliUserID), rawModel, providers, selected.ModelType, len(candidates))
 		}
 
-		// Inject pinned auth ID into request context
+		// 将固定的 auth ID 注入到请求上下文中
 		ctx := handlers.WithPinnedAuthID(c.Request.Context(), selected.CliOauthId)
 		c.Request = c.Request.WithContext(ctx)
 
@@ -90,6 +90,7 @@ type userOauthCandidate struct {
 	ModelType  int    `column:"model_type" json:"modelType"`
 }
 
+// extractProvidersFromRequest 从请求体中解析 model 字段，返回原始模型名和对应的 provider 列表。
 func extractProvidersFromRequest(c *gin.Context) (rawModel string, providers []string) {
 	if c == nil || c.Request == nil {
 		return "", nil
@@ -103,7 +104,7 @@ func extractProvidersFromRequest(c *gin.Context) (rawModel string, providers []s
 		return "", nil
 	}
 
-	// Read and restore body for downstream handlers.
+	// 读取请求体并在读取后恢复，以便下游处理器使用。
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		c.Request.Body = io.NopCloser(bytes.NewReader(nil))
@@ -116,7 +117,7 @@ func extractProvidersFromRequest(c *gin.Context) (rawModel string, providers []s
 		return "", nil
 	}
 
-	// Mirror handler-side model normalization (auto + thinking suffix preservation).
+	// 与处理器端的模型规范化保持一致（auto 模型解析及 thinking 后缀保留）。
 	resolvedModelName := rawModel
 	initialSuffix := thinking.ParseSuffix(rawModel)
 	if initialSuffix.ModelName == "auto" {
@@ -139,6 +140,7 @@ func extractProvidersFromRequest(c *gin.Context) (rawModel string, providers []s
 	return rawModel, providers
 }
 
+// modelTypesForProviders 将 provider 名称列表转换为对应的 modelType 去重列表。
 func modelTypesForProviders(providers []string) []int {
 	if len(providers) == 0 {
 		return nil
@@ -159,6 +161,7 @@ func modelTypesForProviders(providers []string) []int {
 	return out
 }
 
+// listUserOauthCandidates 查询指定 CLI 用户关联的所有可用 OAuth 候选项。
 func listUserOauthCandidates(ctx context.Context, cliUserID string) ([]*userOauthCandidate, error) {
 	cliUserID = strings.TrimSpace(cliUserID)
 	if cliUserID == "" {
@@ -168,7 +171,7 @@ func listUserOauthCandidates(ctx context.Context, cliUserID string) ([]*userOaut
 		ctx = context.Background()
 	}
 
-	// Join cli_user_oauth -> cli_oauth to ensure the referenced auth exists and is enabled.
+	// 关联 cli_user_oauth 和 cli_oauth 表，确保引用的 OAuth 凭据存在且已启用。
 	finder := zorm.NewSelectFinder("cli_user_oauth uo join cli_oauth o on o.id = uo.cli_oauth_id", "uo.cli_oauth_id, o.model_type")
 	finder.Append("where uo.cli_user_id=?", cliUserID)
 	finder.Append("and (o.status is null or o.status=1)")
@@ -181,7 +184,7 @@ func listUserOauthCandidates(ctx context.Context, cliUserID string) ([]*userOaut
 		return nil, nil
 	}
 
-	// Filter out legacy file-name-format IDs (defensive).
+	// 过滤掉旧版文件名格式的 ID（防御性检查）。
 	out := make([]*userOauthCandidate, 0, len(rows))
 	seen := make(map[string]struct{}, len(rows))
 	for _, row := range rows {
@@ -205,6 +208,7 @@ func listUserOauthCandidates(ctx context.Context, cliUserID string) ([]*userOaut
 	return out, nil
 }
 
+// filterCandidatesByModelTypes 按 modelType 过滤候选项，仅保留匹配期望类型的候选。
 func filterCandidatesByModelTypes(candidates []*userOauthCandidate, desired []int) []*userOauthCandidate {
 	if len(candidates) == 0 || len(desired) == 0 {
 		return candidates
@@ -226,6 +230,7 @@ func filterCandidatesByModelTypes(candidates []*userOauthCandidate, desired []in
 	return out
 }
 
+// pickCandidate 从候选项列表中随机选取一个。
 func pickCandidate(candidates []*userOauthCandidate) *userOauthCandidate {
 	if len(candidates) == 0 {
 		return nil
@@ -233,7 +238,7 @@ func pickCandidate(candidates []*userOauthCandidate) *userOauthCandidate {
 	return candidates[rand.IntN(len(candidates))]
 }
 
-// chainMiddleware 灏嗗涓?gin 涓棿浠跺悎骞朵负鍗曚釜 HandlerFunc銆?
+// chainMiddleware 将多个 gin 中间件组合为一个处理器。
 func chainMiddleware(middlewares ...gin.HandlerFunc) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		for _, mw := range middlewares {

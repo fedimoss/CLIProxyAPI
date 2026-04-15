@@ -5,67 +5,125 @@ import (
 	"time"
 )
 
-// Status represents the lifecycle state of an Auth entry.
+// Status 表示认证条目的生命周期状态。
 type Status string
 
 const (
-	// StatusUnknown means the auth state could not be determined.
+	// StatusUnknown 表示无法确定认证状态。
 	StatusUnknown Status = "unknown"
-	// StatusActive indicates the auth is valid and ready for execution.
+	// StatusActive 表示认证有效且可执行。
 	StatusActive Status = "active"
-	// StatusPending indicates the auth is waiting for an external action, such as MFA.
+	// StatusPending 表示认证正在等待外部操作，例如 MFA。
 	StatusPending Status = "pending"
-	// StatusRefreshing indicates the auth is undergoing a refresh flow.
+	// StatusRefreshing 表示认证正在进行刷新流程。
 	StatusRefreshing Status = "refreshing"
-	// StatusError indicates the auth is temporarily unavailable due to errors.
+	// StatusError 表示认证因错误暂时不可用。
 	StatusError Status = "error"
-	// StatusDisabled marks the auth as intentionally disabled.
+	// StatusDisabled 标记认证为手动禁用状态。
 	StatusDisabled Status = "disabled"
 )
 
 const (
-	// DBStatusActive 表示账号正常，可参与请求轮询和定时复检。
+	// DBStatusActive 表示凭证处于活跃状态。
 	DBStatusActive = 1
-	// DBStatusDisabled 表示账号已失活，后续不再自动复检。
+	// DBStatusDisabled 表示凭证已被永久禁用。
 	DBStatusDisabled = 2
-	// DBStatusQuotaLimited 表示账号还活着，但额度不足，需要等待后续定时复检恢复。
+	// DBStatusQuotaLimited 表示凭证存活但暂时受到配额限制。
 	DBStatusQuotaLimited = 3
 )
 
-// NormalizeDBStatus 把数据库里的状态值收敛到当前支持的 1/2/3，避免旧值或脏值影响运行时判断。
+// NormalizeDBStatus 将任意数据库值归约为支持的状态。
 func NormalizeDBStatus(status int) int {
 	switch status {
 	case DBStatusDisabled, DBStatusQuotaLimited:
-		// 当前只允许 2 和 3 原样保留，其他值统一回收到 1。
 		return status
 	default:
 		return DBStatusActive
 	}
 }
 
-// DBStatusForAuth 返回 auth 当前应落库的状态值。
-// 这里优先使用显式写入的 DBStatus，其次再根据 Disabled/Status 做兜底判断。
+// DBStatusForAuth 返回认证的有效持久化数据库状态。
 func DBStatusForAuth(auth *Auth) int {
 	if auth == nil {
 		return DBStatusActive
 	}
 	if auth.DBStatus != 0 {
-		// 运行时已经明确写过 DBStatus 时，优先使用它，避免再次推导把状态改回去。
 		return NormalizeDBStatus(auth.DBStatus)
 	}
 	if auth.Disabled || auth.Status == StatusDisabled {
-		// 没有显式 DBStatus 时，沿用旧逻辑把明确停用的账号视为 2。
 		return DBStatusDisabled
 	}
 	return DBStatusActive
 }
 
-// FormatAutoDisabledStatusMessage 用于生成自动停用后的状态说明。
-// 当前规则很简单：优先原样返回原始错误串，不再拼接额外文案。
+// IsAuthDisabled 当认证应被视为已禁用时返回 true。
+func IsAuthDisabled(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if NormalizeDBStatus(DBStatusForAuth(auth)) == DBStatusDisabled {
+		return true
+	}
+	return auth.Disabled || auth.Status == StatusDisabled
+}
+
+// IsAuthQuotaLimited 当认证处于配额限制状态时返回 true。
+func IsAuthQuotaLimited(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	return NormalizeDBStatus(DBStatusForAuth(auth)) == DBStatusQuotaLimited
+}
+
+// IsAuthActiveForRouting 当认证可以参与路由时返回 true。
+func IsAuthActiveForRouting(auth *Auth) bool {
+	if auth == nil || strings.TrimSpace(auth.ID) == "" {
+		return false
+	}
+	if NormalizeDBStatus(DBStatusForAuth(auth)) != DBStatusActive {
+		return false
+	}
+	return !auth.Disabled && auth.Status != StatusDisabled
+}
+
+// ApplyManualDisabled 为管理操作应用一致的禁用状态。
+func ApplyManualDisabled(auth *Auth, reason string, now time.Time) {
+	if auth == nil {
+		return
+	}
+	auth.DBStatus = DBStatusDisabled
+	auth.Disabled = true
+	auth.Unavailable = false
+	auth.Status = StatusDisabled
+	auth.StatusMessage = strings.TrimSpace(reason)
+	if auth.StatusMessage == "" {
+		auth.StatusMessage = "disabled via management API"
+	}
+	auth.NextRetryAfter = time.Time{}
+	auth.Quota = QuotaState{}
+	auth.UpdatedAt = now
+}
+
+// ApplyManualEnabled 为管理操作应用一致的活跃状态。
+func ApplyManualEnabled(auth *Auth, now time.Time) {
+	if auth == nil {
+		return
+	}
+	auth.DBStatus = DBStatusActive
+	auth.Disabled = false
+	auth.Unavailable = false
+	auth.Status = StatusActive
+	auth.StatusMessage = ""
+	auth.LastError = nil
+	auth.NextRetryAfter = time.Time{}
+	auth.Quota = QuotaState{}
+	auth.UpdatedAt = now
+}
+
+// FormatAutoDisabledStatusMessage 当认证被自动禁用时返回一条稳定的消息。
 func FormatAutoDisabledStatusMessage(reason string, _ time.Time) string {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
-		// 只有完全没有拿到原始错误串时，才退回到一个兜底文案。
 		reason = "permanently disabled by upstream"
 	}
 	return reason
