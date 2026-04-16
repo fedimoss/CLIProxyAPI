@@ -2081,9 +2081,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				clearAuthStateOnSuccess(auth, now)
 			}
 		} else {
-			// 免费计划配额耗尽（usage_limit_reached + plan_type=free），
+			// 配额耗尽（usage_limit_reached + resets_in_seconds < 1小时），
 			// 标记为配额受限状态，等待定时健康探测复检恢复。
-			if isUsageLimitReachedFreePlanResultError(result.Error) {
+			if isUsageLimitReachedShortResetResultError(result.Error) {
 				quotaReason := "quota exhausted (usage_limit_reached)"
 				failure := extractCliproxyFailureReasonLocal(result.Error.Message, m.oauthHealthProbeMinRemainingWeeklyPercent())
 				if failure != nil && strings.TrimSpace(failure.Reason) != "" {
@@ -2689,9 +2689,9 @@ func applyAuthQuotaLimitedState(auth *Auth, result Result, reason string, now ti
 	state.UpdatedAt = now
 }
 
-// isUsageLimitReachedFreePlanResultError 判断错误是否为免费计划配额耗尽（usage_limit_reached + plan_type=free）。
+// isUsageLimitReachedShortResetResultError 判断错误是否为配额耗尽且短期内重置（usage_limit_reached + resets_in_seconds < 1小时）。
 // 这类错误不应视为账号失活，而是配额受限，需要与 401 未授权错误区分处理。
-func isUsageLimitReachedFreePlanResultError(resultErr *Error) bool {
+func isUsageLimitReachedShortResetResultError(resultErr *Error) bool {
 	if resultErr == nil {
 		return false
 	}
@@ -2704,28 +2704,27 @@ func isUsageLimitReachedFreePlanResultError(resultErr *Error) bool {
 	if !ok {
 		return false
 	}
-	if hasUsageLimitReachedFreePlanFields(data) {
+	if hasUsageLimitReachedShortResetFields(data) {
 		return true
 	}
 	errorData, ok := decodePossibleJSONPayloadLocal(data["error"]).(map[string]any)
 	if !ok {
 		return false
 	}
-	return hasUsageLimitReachedFreePlanFields(errorData)
+	return hasUsageLimitReachedShortResetFields(errorData)
 }
 
-// hasUsageLimitReachedFreePlanFields 检查 JSON 数据中是否包含 usage_limit_reached 类型和 free 计划标识。
-func hasUsageLimitReachedFreePlanFields(data map[string]any) bool {
+// hasUsageLimitReachedShortResetFields 检查 JSON 数据中是否包含 usage_limit_reached 类型且 resets_in_seconds < 3600。
+func hasUsageLimitReachedShortResetFields(data map[string]any) bool {
 	if len(data) == 0 {
 		return false
 	}
 	errType, okType := stringValueFromAnyLocal(data["type"])
-	planType, okPlanType := stringValueFromAnyLocal(data["plan_type"])
-	if !okType || !okPlanType {
+	if !okType || !strings.EqualFold(strings.TrimSpace(errType), "usage_limit_reached") {
 		return false
 	}
-	return strings.EqualFold(strings.TrimSpace(errType), "usage_limit_reached") &&
-		strings.EqualFold(strings.TrimSpace(planType), "free")
+	resetsInSeconds, _ := intValueFromAnyLocal(data["resets_in_seconds"])
+	return resetsInSeconds > 0 && resetsInSeconds < 3600
 }
 
 func disabledResultError(resultErr *Error, reason string) *Error {

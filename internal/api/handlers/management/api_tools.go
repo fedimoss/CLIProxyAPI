@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/geminicli"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
@@ -209,10 +210,20 @@ func (h *Handler) APICall(c *gin.Context) {
 		return
 	}
 
+	respBodyStr := string(respBody)
+
+	// 检查响应是否指示 OAuth 额度耗尽，若是则将账号标记为状态3（配额受限），
+	// 从内存中取消注册并移除模型注册。复用健康探测的判断逻辑。
+	if auth != nil && h.authManager != nil {
+		if quotaLimited, reason := h.authManager.CheckQuotaExhaustion(respBodyStr); quotaLimited {
+			h.applyQuotaLimitForAuth(c.Request.Context(), auth, reason)
+		}
+	}
+
 	c.JSON(http.StatusOK, apiCallResponse{
 		StatusCode: resp.StatusCode,
 		Header:     resp.Header,
-		Body:       string(respBody),
+		Body:       respBodyStr,
 	})
 }
 
@@ -788,4 +799,31 @@ func buildProxyTransport(proxyStr string) *http.Transport {
 		return nil
 	}
 	return transport
+}
+
+// applyQuotaLimitForAuth 将 OAuth 账号标记为配额受限（状态3），
+// 从内存中取消注册并移除模型注册。
+func (h *Handler) applyQuotaLimitForAuth(ctx context.Context, auth *coreauth.Auth, reason string) {
+	if auth == nil || h.authManager == nil {
+		return
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "quota exhausted"
+	}
+	now := time.Now()
+	auth.DBStatus = coreauth.DBStatusQuotaLimited
+	auth.Disabled = false
+	auth.Unavailable = true
+	auth.Status = coreauth.StatusError
+	auth.StatusMessage = strings.TrimSpace(reason)
+	auth.LastError = &coreauth.Error{
+		Code:    "quota_limited",
+		Message: strings.TrimSpace(reason),
+	}
+	auth.UpdatedAt = now
+	auth.Quota = coreauth.QuotaState{Exceeded: true, Reason: "quota"}
+	auth.NextRetryAfter = time.Time{}
+	_, _ = h.authManager.Update(ctx, auth)
+	registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+	log.WithField("auth_id", auth.ID).Info("oauth quota exhausted, marked as status 3 and unregistered")
 }

@@ -695,6 +695,58 @@ func formatKnownCliproxyErrorLocal(keyword string) string {
 	}
 }
 
+// CheckQuotaExhaustion 检查 API 响应体是否表示配额耗尽。
+// 复用健康探测的判断逻辑，同时支持 Codex usage 数组格式。
+// 返回是否配额受限及原因描述。
+func (m *Manager) CheckQuotaExhaustion(body string) (quotaLimited bool, reason string) {
+	if m == nil || strings.TrimSpace(body) == "" {
+		return false, ""
+	}
+
+	minRemaining := m.oauthHealthProbeMinRemainingWeeklyPercent()
+
+	// 1. 先用标准健康探测逻辑检查（处理 error 对象、rate_limit 等格式）
+	if failure := extractCliproxyFailureReasonLocal(body, minRemaining); failure != nil {
+		return failure.QuotaLimited, failure.Reason
+	}
+
+	// 2. 尝试解析为 JSON 数组（Codex usage 格式）
+	// [{"type":"codex","usage_limit_reached":false,...,"usage":[{"type":"code_search","usage_limit_reached":true,...}]}]
+	decoded := decodePossibleJSONPayloadLocal(body)
+	arr, ok := decoded.([]any)
+	if !ok {
+		return false, ""
+	}
+
+	var checkItems []map[string]any
+	for _, item := range arr {
+		if obj, ok := item.(map[string]any); ok {
+			checkItems = append(checkItems, obj)
+			// 展开嵌套的 usage 数组
+			if usageArr, ok := obj["usage"].([]any); ok {
+				for _, usageItem := range usageArr {
+					if usageObj, ok := usageItem.(map[string]any); ok {
+						checkItems = append(checkItems, usageObj)
+					}
+				}
+			}
+		}
+	}
+
+	for _, item := range checkItems {
+		if limitReached, _ := boolValueFromAnyLocal(item["usage_limit_reached"]); limitReached {
+			itemType, _ := stringValueFromAnyLocal(item["type"])
+			reason := "usage limit reached"
+			if strings.TrimSpace(itemType) != "" {
+				reason = "usage limit reached (" + strings.TrimSpace(itemType) + ")"
+			}
+			return true, reason
+		}
+	}
+
+	return false, ""
+}
+
 // stringValueFromAnyLocal 尝试将任意值转换为字符串。
 func stringValueFromAnyLocal(value any) (string, bool) {
 	switch typed := value.(type) {
