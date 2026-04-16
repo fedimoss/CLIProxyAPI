@@ -12,6 +12,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/clioauth"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/entity"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/tidwall/gjson"
 )
 
 // DBTokenStore 基于数据库的 Token 存储实现，提供 OAuth 凭据的增删查改操作。
@@ -67,10 +68,12 @@ func (s *DBTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (strin
 	}
 
 	now := time.Now()
+	accountID := strings.TrimSpace(gjson.GetBytes(oauthJSON, "account_id").String())
 	record := entity.CLIOauth{
 		Oauth:     string(oauthJSON),
 		ModelType: clioauth.ProviderToModelType(auth.Provider),
 		UpdatedAt: &now,
+		AccountID: accountID,
 	}
 	record.ID = auth.ID
 
