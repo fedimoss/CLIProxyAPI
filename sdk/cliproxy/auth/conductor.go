@@ -2081,32 +2081,27 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				clearAuthStateOnSuccess(auth, now)
 			}
 		} else {
-			if reason, okDisable := autoDisableReason(result.Error); okDisable {
+			// 免费计划配额耗尽（usage_limit_reached + plan_type=free），
+			// 标记为配额受限状态，等待定时健康探测复检恢复。
+			if isUsageLimitReachedFreePlanResultError(result.Error) {
+				quotaReason := "quota exhausted (usage_limit_reached)"
+				failure := extractCliproxyFailureReasonLocal(result.Error.Message, m.oauthHealthProbeMinRemainingWeeklyPercent())
+				if failure != nil && strings.TrimSpace(failure.Reason) != "" {
+					quotaReason = strings.TrimSpace(failure.Reason)
+				}
+				applyAuthQuotaLimitedState(auth, result, quotaReason, now)
+				_ = m.persist(ctx, auth)
+				authSnapshot = auth.Clone()
+				shouldUnregisterClient = true
+			} else if reason, okDisable := autoDisableReason(result.Error); okDisable {
+				// 401 未授权错误：区分配额受限和账号失活两种情况。
 				failure := extractCliproxyFailureReasonLocal(result.Error.Message, m.oauthHealthProbeMinRemainingWeeklyPercent())
 				if failure != nil && failure.QuotaLimited {
 					quotaReason := reason
 					if failure.Reason != "" {
 						quotaReason = failure.Reason
 					}
-					auth.DBStatus = DBStatusQuotaLimited
-					auth.Disabled = false
-					auth.Unavailable = true
-					auth.Status = StatusError
-					auth.StatusMessage = quotaReason
-					auth.UpdatedAt = now
-					auth.Quota = QuotaState{Exceeded: true, Reason: "quota"}
-					auth.LastError = &Error{
-						Code:       "quota_limited",
-						Message:    quotaReason,
-						HTTPStatus: result.Error.HTTPStatus,
-					}
-					if result.Model != "" {
-						state := ensureModelState(auth, result.Model)
-						state.Status = StatusError
-						state.StatusMessage = quotaReason
-						state.Unavailable = true
-						state.UpdatedAt = now
-					}
+					applyAuthQuotaLimitedState(auth, result, quotaReason, now)
 				} else {
 					disableAuthForPermanentFailure(auth, result, reason, now)
 				}
@@ -2439,7 +2434,8 @@ func retryAfterFromError(err error) *time.Duration {
 	if retryAfter == nil {
 		return nil
 	}
-	return new(*retryAfter)
+	// retryAfter 是变量不是类型。应该直接返回指针
+	return retryAfter
 }
 
 func statusCodeFromResult(err *Error) int {
@@ -2661,6 +2657,75 @@ func disableAuthForPermanentFailure(auth *Auth, result Result, reason string, no
 	state.Quota = QuotaState{}
 	state.UpdatedAt = now
 	state.LastError = disabledResultError(result.Error, reason)
+}
+
+// applyAuthQuotaLimitedState 将认证标记为配额受限状态（DBStatus=QuotaLimited）。
+// 配额受限的账号不会被选号路由，但定时健康探测会持续复检，额度恢复后自动重新激活。
+func applyAuthQuotaLimitedState(auth *Auth, result Result, reason string, now time.Time) {
+	if auth == nil {
+		return
+	}
+	auth.DBStatus = DBStatusQuotaLimited
+	auth.Disabled = false
+	auth.Unavailable = true
+	auth.Status = StatusError
+	auth.StatusMessage = strings.TrimSpace(reason)
+	auth.UpdatedAt = now
+	auth.Quota = QuotaState{Exceeded: true, Reason: "quota"}
+	if result.Error != nil {
+		auth.LastError = &Error{
+			Code:       "quota_limited",
+			Message:    strings.TrimSpace(reason),
+			HTTPStatus: result.Error.HTTPStatus,
+		}
+	}
+	if result.Model == "" {
+		return
+	}
+	state := ensureModelState(auth, result.Model)
+	state.Status = StatusError
+	state.StatusMessage = strings.TrimSpace(reason)
+	state.Unavailable = true
+	state.UpdatedAt = now
+}
+
+// isUsageLimitReachedFreePlanResultError 判断错误是否为免费计划配额耗尽（usage_limit_reached + plan_type=free）。
+// 这类错误不应视为账号失活，而是配额受限，需要与 401 未授权错误区分处理。
+func isUsageLimitReachedFreePlanResultError(resultErr *Error) bool {
+	if resultErr == nil {
+		return false
+	}
+	raw := strings.TrimSpace(resultErr.Message)
+	if raw == "" {
+		return false
+	}
+	decoded := decodePossibleJSONPayloadLocal(raw)
+	data, ok := decoded.(map[string]any)
+	if !ok {
+		return false
+	}
+	if hasUsageLimitReachedFreePlanFields(data) {
+		return true
+	}
+	errorData, ok := decodePossibleJSONPayloadLocal(data["error"]).(map[string]any)
+	if !ok {
+		return false
+	}
+	return hasUsageLimitReachedFreePlanFields(errorData)
+}
+
+// hasUsageLimitReachedFreePlanFields 检查 JSON 数据中是否包含 usage_limit_reached 类型和 free 计划标识。
+func hasUsageLimitReachedFreePlanFields(data map[string]any) bool {
+	if len(data) == 0 {
+		return false
+	}
+	errType, okType := stringValueFromAnyLocal(data["type"])
+	planType, okPlanType := stringValueFromAnyLocal(data["plan_type"])
+	if !okType || !okPlanType {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(errType), "usage_limit_reached") &&
+		strings.EqualFold(strings.TrimSpace(planType), "free")
 }
 
 func disabledResultError(resultErr *Error, reason string) *Error {

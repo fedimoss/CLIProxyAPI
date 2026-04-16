@@ -1157,3 +1157,93 @@ func TestManager_RequestScopedNotFoundStopsRetryWithoutSuspendingAuth(t *testing
 		t.Fatalf("expected request-scoped 404 to avoid bad auth model cooldown state, got %#v", state)
 	}
 }
+
+func TestManager_MarkResult_UsageLimitReachedFreePlanMovesToQuotaLimitedAndUnregisters(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID:       "auth-usage-limit-free",
+		Provider: "codex",
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "gpt-5.3-codex"
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	raw := `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"free","resets_at":1776924664,"eligible_promo":{"campaign_id":"plus-1-month-free","message":"To continue using Codex and get access to GPT-5.3-Codex, start a free trial of Plus today (https://chatgpt.com/explore/plus)"},"resets_in_seconds":603641}}`
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    model,
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: http.StatusTooManyRequests,
+			Message:    raw,
+		},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to remain queryable")
+	}
+	if DBStatusForAuth(updated) != DBStatusQuotaLimited {
+		t.Fatalf("db status = %d, want %d", DBStatusForAuth(updated), DBStatusQuotaLimited)
+	}
+	if updated.Disabled {
+		t.Fatalf("expected auth not disabled")
+	}
+	if !updated.Unavailable {
+		t.Fatalf("expected auth unavailable")
+	}
+	if updated.LastError == nil || updated.LastError.Code != "quota_limited" {
+		t.Fatalf("last error = %#v, want quota_limited", updated.LastError)
+	}
+	if models := reg.GetModelsForClient(auth.ID); len(models) != 0 {
+		t.Fatalf("models = %v, want empty after unregister", models)
+	}
+}
+
+func TestManager_MarkResult_UsageLimitReachedNonFreeDoesNotMoveToQuotaLimitedAndUnregister(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID:       "auth-usage-limit-plus",
+		Provider: "codex",
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "gpt-5.3-codex"
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	raw := `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"plus","resets_at":1776924664,"resets_in_seconds":603641}}`
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    model,
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: http.StatusTooManyRequests,
+			Message:    raw,
+		},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to remain queryable")
+	}
+	if DBStatusForAuth(updated) != DBStatusActive {
+		t.Fatalf("db status = %d, want %d", DBStatusForAuth(updated), DBStatusActive)
+	}
+	if updated.LastError == nil {
+		t.Fatalf("expected last error to be recorded")
+	}
+	if models := reg.GetModelsForClient(auth.ID); len(models) == 0 {
+		t.Fatalf("expected models to stay registered")
+	}
+}

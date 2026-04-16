@@ -26,7 +26,7 @@ type authAutoRefreshLoop struct {
 
 func newAuthAutoRefreshLoop(manager *Manager, interval time.Duration, concurrency int) *authAutoRefreshLoop {
 	if interval <= 0 {
-		interval = refreshCheckInterval
+		interval = refreshCheckInterval // 无任何刷新信息时的最后兜底
 	}
 	if concurrency <= 0 {
 		concurrency = refreshMaxConcurrency
@@ -337,6 +337,11 @@ func (l *authAutoRefreshLoop) remove(authID string) {
 
 func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time.Time, bool) {
 	if auth == nil || auth.Disabled {
+		return time.Time{}, false
+	}
+
+	// 配额受限的账号由定时健康探测负责复检，刷新循环无需介入。
+	if DBStatusForAuth(auth) == DBStatusQuotaLimited {
 		return time.Time{}, false
 	}
 
