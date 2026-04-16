@@ -58,7 +58,7 @@ type RefreshEvaluator interface {
 }
 
 const (
-	refreshCheckInterval                     = 5 * time.Second
+	refreshCheckInterval                     = 10 * time.Minute // 无任何刷新信息时的最后兜底
 	refreshMaxConcurrency                    = 16
 	refreshPendingBackoff                    = time.Minute
 	refreshFailureBackoff                    = 5 * time.Minute
@@ -2867,16 +2867,17 @@ func (m *Manager) StartAutoRefreshLocal(parent context.Context, interval time.Du
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		m.checkAuthHealthProbesLocal(ctx)
+		//m.checkAuthHealthProbesLocal(ctx) // ← 启动时立即执行一次
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				m.checkAuthHealthProbesLocal(ctx)
+				m.checkAuthHealthProbesLocal(ctx) // ← 之后每 interval 周期执行
 			}
 		}
 	}()
+
 }
 
 // StopAutoRefresh 取消后台刷新循环（如果正在运行）。
