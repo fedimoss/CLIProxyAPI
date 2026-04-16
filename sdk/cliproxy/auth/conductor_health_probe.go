@@ -711,7 +711,7 @@ func (m *Manager) CheckQuotaExhaustion(body string) (quotaLimited bool, reason s
 	}
 
 	// 2. 尝试解析为 JSON 数组（Codex usage 格式）
-	// [{"type":"codex","usage_limit_reached":false,...,"usage":[{"type":"code_search","usage_limit_reached":true,...}]}]
+	// [{"type":"codex","usage_limit_reached":false,...,"usage":[{"type":"code_search","usage_limit_reached":true,"resets_in_seconds":86400,...}]}]
 	decoded := decodePossibleJSONPayloadLocal(body)
 	arr, ok := decoded.([]any)
 	if !ok {
@@ -722,7 +722,6 @@ func (m *Manager) CheckQuotaExhaustion(body string) (quotaLimited bool, reason s
 	for _, item := range arr {
 		if obj, ok := item.(map[string]any); ok {
 			checkItems = append(checkItems, obj)
-			// 展开嵌套的 usage 数组
 			if usageArr, ok := obj["usage"].([]any); ok {
 				for _, usageItem := range usageArr {
 					if usageObj, ok := usageItem.(map[string]any); ok {
@@ -735,12 +734,15 @@ func (m *Manager) CheckQuotaExhaustion(body string) (quotaLimited bool, reason s
 
 	for _, item := range checkItems {
 		if limitReached, _ := boolValueFromAnyLocal(item["usage_limit_reached"]); limitReached {
-			itemType, _ := stringValueFromAnyLocal(item["type"])
-			reason := "usage limit reached"
-			if strings.TrimSpace(itemType) != "" {
-				reason = "usage limit reached (" + strings.TrimSpace(itemType) + ")"
+			resetsInSeconds, _ := intValueFromAnyLocal(item["resets_in_seconds"])
+			if resetsInSeconds > 1800 {
+				itemType, _ := stringValueFromAnyLocal(item["type"])
+				reason := "usage limit reached"
+				if strings.TrimSpace(itemType) != "" {
+					reason = "usage limit reached (" + strings.TrimSpace(itemType) + ")"
+				}
+				return true, reason
 			}
-			return true, reason
 		}
 	}
 

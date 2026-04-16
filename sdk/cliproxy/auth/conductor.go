@@ -2714,7 +2714,7 @@ func isUsageLimitReachedShortResetResultError(resultErr *Error) bool {
 	return hasUsageLimitReachedShortResetFields(errorData)
 }
 
-// hasUsageLimitReachedShortResetFields 检查 JSON 数据中是否包含 usage_limit_reached 类型且 resets_in_seconds < 3600。
+// hasUsageLimitReachedShortResetFields 检查 JSON 数据中是否包含 usage_limit_reached 类型且 resets_in_seconds > 1800（30分钟）。
 func hasUsageLimitReachedShortResetFields(data map[string]any) bool {
 	if len(data) == 0 {
 		return false
@@ -2724,7 +2724,7 @@ func hasUsageLimitReachedShortResetFields(data map[string]any) bool {
 		return false
 	}
 	resetsInSeconds, _ := intValueFromAnyLocal(data["resets_in_seconds"])
-	return resetsInSeconds > 0 && resetsInSeconds < 3600
+	return resetsInSeconds > 1800
 }
 
 func disabledResultError(resultErr *Error, reason string) *Error {
