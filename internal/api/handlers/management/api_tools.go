@@ -212,8 +212,16 @@ func (h *Handler) APICall(c *gin.Context) {
 
 	respBodyStr := string(respBody)
 
-	// 检查响应是否指示 OAuth 额度耗尽，若是则将账号标记为状态3（配额受限），
-	// 从内存中取消注册并移除模型注册。复用健康探测的判断逻辑。
+	// ── APICall 路径：额度耗尽检测 ──
+	// 与 MarkResult 路径不同，此处复用定时健康探测的完整判断逻辑（extractCliproxyFailureReasonLocal），
+	// 通过 config.yaml 中 min-remaining-weekly-percent 阈值判断额度是否充足。
+	// 支持的响应格式：
+	//   1. 标准 error/rate_limit 格式（健康探测已支持）
+	//   2. Codex usage 数组格式，例：
+	//      [{"type":"codex","usage_limit_reached":false,...,
+	//        "usage":[{"type":"code_search","usage_limit_reached":true,"resets_in_seconds":86400,...}]}]
+	// 判断条件：usage_limit_reached 为 true（布尔值）且 resets_in_seconds > 1800（30分钟）时标记为状态3。
+	// 命中后从内存中取消注册并移除模型注册，等待定时健康探测复检恢复。
 	if auth != nil && h.authManager != nil {
 		if quotaLimited, reason := h.authManager.CheckQuotaExhaustion(respBodyStr); quotaLimited {
 			h.applyQuotaLimitForAuth(c.Request.Context(), auth, reason)

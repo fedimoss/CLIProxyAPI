@@ -695,8 +695,18 @@ func formatKnownCliproxyErrorLocal(keyword string) string {
 	}
 }
 
-// CheckQuotaExhaustion 检查 API 响应体是否表示配额耗尽。
-// 复用健康探测的判断逻辑，同时支持 Codex usage 数组格式。
+// CheckQuotaExhaustion 检查 API 响应体是否表示配额耗尽（用于 APICall 路径）。
+//
+// 判断逻辑分两步：
+//  1. 复用定时健康探测逻辑（extractCliproxyFailureReasonLocal），通过 config.yaml 中
+//     min-remaining-weekly-percent 阈值判断额度是否充足。支持标准 error 对象、rate_limit 等格式。
+//  2. 解析 Codex usage 数组格式，遍历每个元素及嵌套 usage 数组，
+//     检查 usage_limit_reached 为 true（布尔值）且 resets_in_seconds > 1800（30分钟）。
+//
+// 与 MarkResult 路径的区别：
+//   - MarkResult 路径检查的是错误响应中 type="usage_limit_reached"（字符串）+ resets_in_seconds > 1800
+//   - 本方法（APICall 路径）额外支持 Codex usage 数组中 usage_limit_reached: true（布尔值）的检查
+//
 // 返回是否配额受限及原因描述。
 func (m *Manager) CheckQuotaExhaustion(body string) (quotaLimited bool, reason string) {
 	if m == nil || strings.TrimSpace(body) == "" {

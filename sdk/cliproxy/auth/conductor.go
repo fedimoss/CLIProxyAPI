@@ -2081,8 +2081,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				clearAuthStateOnSuccess(auth, now)
 			}
 		} else {
-			// 配额耗尽（usage_limit_reached + resets_in_seconds < 1小时），
-			// 标记为配额受限状态，等待定时健康探测复检恢复。
+			// ── MarkResult 路径：配额耗尽检测 ──
+			// 判断条件：响应中包含 "type":"usage_limit_reached" 且 resets_in_seconds > 1800（30分钟）。
+			// 响应示例：{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached",
+			//   "plan_type":"plus","resets_at":1776326990,"resets_in_seconds":86400}}
+			// 命中后将账号标记为配额受限（状态3），从内存中取消注册，等待定时健康探测复检恢复。
+			// 注意：此处只处理 type 为 "usage_limit_reached" 字符串的错误格式，不涉及布尔值 usage_limit_reached。
 			if isUsageLimitReachedShortResetResultError(result.Error) {
 				quotaReason := "quota exhausted (usage_limit_reached)"
 				failure := extractCliproxyFailureReasonLocal(result.Error.Message, m.oauthHealthProbeMinRemainingWeeklyPercent())
@@ -2689,8 +2693,10 @@ func applyAuthQuotaLimitedState(auth *Auth, result Result, reason string, now ti
 	state.UpdatedAt = now
 }
 
-// isUsageLimitReachedShortResetResultError 判断错误是否为配额耗尽且短期内重置（usage_limit_reached + resets_in_seconds < 1小时）。
-// 这类错误不应视为账号失活，而是配额受限，需要与 401 未授权错误区分处理。
+// isUsageLimitReachedShortResetResultError 判断错误是否为配额耗尽（type="usage_limit_reached" 且 resets_in_seconds > 1800）。
+// 用于 MarkResult 路径：当 OAuth 账号请求返回包含 usage_limit_reached 错误且重置时间超过30分钟时，
+// 将其标记为配额受限（状态3）而非账号失活，等待定时健康探测复检恢复。
+// 响应格式示例：{"error":{"type":"usage_limit_reached","resets_in_seconds":86400}}
 func isUsageLimitReachedShortResetResultError(resultErr *Error) bool {
 	if resultErr == nil {
 		return false
@@ -2714,7 +2720,8 @@ func isUsageLimitReachedShortResetResultError(resultErr *Error) bool {
 	return hasUsageLimitReachedShortResetFields(errorData)
 }
 
-// hasUsageLimitReachedShortResetFields 检查 JSON 数据中是否包含 usage_limit_reached 类型且 resets_in_seconds > 1800（30分钟）。
+// hasUsageLimitReachedShortResetFields 检查 JSON 数据中 type 是否为 "usage_limit_reached"（字符串）且 resets_in_seconds > 1800（30分钟）。
+// 仅用于 MarkResult 路径，处理错误响应格式。
 func hasUsageLimitReachedShortResetFields(data map[string]any) bool {
 	if len(data) == 0 {
 		return false
