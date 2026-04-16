@@ -14,13 +14,10 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// MarkResultLocal 记录认证执行结果，并在成功时调度健康探测。
+// MarkResultLocal records execution results for auth state updates.
+// Health probes are triggered only by the periodic scheduler.
 func (m *Manager) MarkResultLocal(ctx context.Context, result Result) {
 	m.MarkResult(ctx, result)
-	if m == nil || !result.Success {
-		return
-	}
-	m.scheduleAuthHealthProbeLocal(result.AuthID)
 }
 
 // authHealthProbeSpecLocal 定义健康探测的请求规格，包括方法、URL和请求头。
@@ -41,15 +38,6 @@ type authHealthProbeDecisionLocal struct {
 	DBStatus   int
 	HTTPStatus int
 	Reason     string
-}
-
-// scheduleAuthHealthProbeLocal 异步调度指定认证的健康探测。
-func (m *Manager) scheduleAuthHealthProbeLocal(authID string) {
-	authID = strings.TrimSpace(authID)
-	if m == nil || authID == "" {
-		return
-	}
-	go m.runAuthHealthProbeWithLimitLocal(context.Background(), authID)
 }
 
 // checkAuthHealthProbesLocal 检查所有支持健康探测的认证，批量启动探测。
