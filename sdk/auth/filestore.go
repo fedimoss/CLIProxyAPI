@@ -197,7 +197,7 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 	if provider == "" {
 		provider = "unknown"
 	}
-	if provider == "antigravity" || provider == "gemini" {
+	if provider == "antigravity" || provider == "gemini" || provider == "gemini-cli" {
 		projectID := ""
 		if pid, ok := metadata["project_id"].(string); ok {
 			projectID = strings.TrimSpace(pid)
@@ -206,7 +206,7 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 			accessToken := extractAccessToken(metadata)
 			// For gemini type, the stored access_token is likely expired (~1h lifetime).
 			// Refresh it using the long-lived refresh_token before querying.
-			if provider == "gemini" {
+			if provider == "gemini" || provider == "gemini-cli" {
 				if tokenMap, ok := metadata["token"].(map[string]any); ok {
 					if refreshed, errRefresh := refreshGeminiAccessToken(tokenMap, http.DefaultClient); errRefresh == nil {
 						accessToken = refreshed

@@ -428,7 +428,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 		fileName := geminiAuth.CredentialFileName(ts.Email, ts.ProjectID, true)
 		record := &coreauth.Auth{
 			ID:       fileName,
-			Provider: "gemini",
+			Provider: "gemini-cli",
 			FileName: fileName,
 			Storage:  &ts,
 			Metadata: recordMetadata,

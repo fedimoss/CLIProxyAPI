@@ -23,7 +23,7 @@ func ProviderToModelType(provider string) int {
 		return ModelTypeAnthropic
 	case "qwen":
 		return ModelTypeQwen
-	case "gemini":
+	case "gemini", "gemini-cli":
 		return ModelTypeGemini
 	case "antigravity":
 		return ModelTypeAntigravity
