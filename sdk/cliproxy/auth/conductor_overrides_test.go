@@ -69,7 +69,7 @@ func TestManager_ShouldRetryAfterError_UsesOAuthModelAliasForCooldown(t *testing
 	m := NewManager(nil, nil, nil)
 	m.SetRetryConfig(3, 30*time.Second, 0)
 	m.SetOAuthModelAlias(map[string][]internalconfig.OAuthModelAlias{
-		"iflow": {
+		"kimi": {
 			{Name: "deepseek-v3.1", Alias: "pool-model"},
 		},
 	})
@@ -80,7 +80,7 @@ func TestManager_ShouldRetryAfterError_UsesOAuthModelAliasForCooldown(t *testing
 
 	auth := &Auth{
 		ID:       "auth-1",
-		Provider: "iflow",
+		Provider: "kimi",
 		ModelStates: map[string]*ModelState{
 			upstreamModel: {
 				Unavailable:    true,
@@ -99,7 +99,7 @@ func TestManager_ShouldRetryAfterError_UsesOAuthModelAliasForCooldown(t *testing
 	}
 
 	_, _, maxWait := m.retrySettings()
-	wait, shouldRetry := m.shouldRetryAfterError(&Error{HTTPStatus: 429, Message: "quota"}, 0, []string{"iflow"}, routeModel, maxWait)
+	wait, shouldRetry := m.shouldRetryAfterError(&Error{HTTPStatus: 429, Message: "quota"}, 0, []string{"kimi"}, routeModel, maxWait)
 	if !shouldRetry {
 		t.Fatalf("expected shouldRetry=true, got false (wait=%v)", wait)
 	}
@@ -1206,7 +1206,7 @@ func TestManager_MarkResult_UsageLimitReachedFreePlanMovesToQuotaLimitedAndUnreg
 	}
 }
 
-func TestManager_MarkResult_UsageLimitReachedNonFreeDoesNotMoveToQuotaLimitedAndUnregister(t *testing.T) {
+func TestManager_MarkResult_UsageLimitReachedLongResetMovesToQuotaLimitedAndUnregisters(t *testing.T) {
 	m := NewManager(nil, nil, nil)
 	auth := &Auth{
 		ID:       "auth-usage-limit-plus",
@@ -1222,6 +1222,54 @@ func TestManager_MarkResult_UsageLimitReachedNonFreeDoesNotMoveToQuotaLimitedAnd
 	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
 
 	raw := `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"plus","resets_at":1776924664,"resets_in_seconds":603641}}`
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: auth.Provider,
+		Model:    model,
+		Success:  false,
+		Error: &Error{
+			HTTPStatus: http.StatusTooManyRequests,
+			Message:    raw,
+		},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to remain queryable")
+	}
+	if DBStatusForAuth(updated) != DBStatusQuotaLimited {
+		t.Fatalf("db status = %d, want %d", DBStatusForAuth(updated), DBStatusQuotaLimited)
+	}
+	if updated.Disabled {
+		t.Fatalf("expected auth not disabled")
+	}
+	if !updated.Unavailable {
+		t.Fatalf("expected auth unavailable")
+	}
+	if updated.LastError == nil || updated.LastError.Code != "quota_limited" {
+		t.Fatalf("last error = %#v, want quota_limited", updated.LastError)
+	}
+	if models := reg.GetModelsForClient(auth.ID); len(models) != 0 {
+		t.Fatalf("models = %v, want empty after unregister", models)
+	}
+}
+
+func TestManager_MarkResult_UsageLimitReachedShortResetDoesNotMoveToQuotaLimitedOrUnregister(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID:       "auth-usage-limit-plus-short-reset",
+		Provider: "codex",
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "gpt-5.3-codex"
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	raw := `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"plus","resets_at":1776924664,"resets_in_seconds":1200}}`
 	m.MarkResult(context.Background(), Result{
 		AuthID:   auth.ID,
 		Provider: auth.Provider,

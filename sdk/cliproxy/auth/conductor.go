@@ -110,6 +110,14 @@ type Selector interface {
 }
 
 // Hook 捕获生命周期回调，用于观察认证状态变更。
+// StoppableSelector is an optional interface for selectors that hold resources.
+// Selectors that implement this interface will have Stop called during shutdown.
+type StoppableSelector interface {
+	Selector
+	Stop()
+}
+
+// Hook captures lifecycle callbacks for observing auth changes.
 type Hook interface {
 	// OnAuthRegistered 在新认证注册时触发。
 	OnAuthRegistered(ctx context.Context, auth *Auth)
@@ -2952,6 +2960,8 @@ func (m *Manager) StartAutoRefreshLocal(parent context.Context, interval time.Du
 }
 
 // StopAutoRefresh 取消后台刷新循环（如果正在运行）。
+// StopAutoRefresh cancels the background refresh loop, if running.
+// It also stops the selector if it implements StoppableSelector.
 func (m *Manager) StopAutoRefresh() {
 	m.mu.Lock()
 	cancel := m.refreshCancel
@@ -2960,6 +2970,10 @@ func (m *Manager) StopAutoRefresh() {
 	m.mu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+	// Stop selector if it implements StoppableSelector (e.g., SessionAffinitySelector)
+	if stoppable, ok := m.selector.(StoppableSelector); ok {
+		stoppable.Stop()
 	}
 }
 
