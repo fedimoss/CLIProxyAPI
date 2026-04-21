@@ -2946,7 +2946,7 @@ func (m *Manager) StartAutoRefreshLocal(parent context.Context, interval time.Du
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		//m.checkAuthHealthProbesLocal(ctx) // ← 启动时立即执行一次
+		m.checkAuthHealthProbesLocal(ctx) // ← 启动时立即执行一次
 		for {
 			select {
 			case <-ctx.Done():
