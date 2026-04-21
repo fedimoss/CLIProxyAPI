@@ -183,6 +183,15 @@ func (m *Manager) classifyAuthHealthProbeLocal(httpStatus int, body string) auth
 				Reason:     healthProbeFailureReasonLocal(httpStatus, body),
 			}
 		}
+		// 原因: OpenAI服务服务故障，返回"{"status":403,"detail":"Forbidden","message":"HTTP 403"}"，被误判为账号封禁，修改为状态2
+		// 解决: 遇到"{"status":403,"detail":"Forbidden","message":"HTTP 403"}"，视为额度受限，修改为状态3，以便后续复检自动恢复
+		if httpStatus == http.StatusForbidden && isGenericForbiddenResponseLocal(body) {
+			return authHealthProbeDecisionLocal{
+				DBStatus:   DBStatusQuotaLimited,
+				HTTPStatus: httpStatus,
+				Reason:     reason,
+			}
+		}
 		return authHealthProbeDecisionLocal{
 			DBStatus:   DBStatusDisabled,
 			HTTPStatus: httpStatus,
@@ -228,6 +237,21 @@ func normalizeQuotaHealthProbeStatusCodeLocal(status int) int {
 		return http.StatusTooManyRequests
 	}
 	return status
+}
+
+// isGenericForbiddenResponseLocal 判断响应体是否为通用的空 403 响应（无具体错误信息）。
+func isGenericForbiddenResponseLocal(body string) bool {
+	decoded := decodePossibleJSONPayloadLocal(body)
+	data, ok := decoded.(map[string]any)
+	if !ok {
+		return false
+	}
+	statusCode, hasStatus := intValueFromAnyLocal(data["status"])
+	detail, hasDetail := stringValueFromAnyLocal(data["detail"])
+	message, hasMessage := stringValueFromAnyLocal(data["message"])
+	return hasStatus && statusCode == http.StatusForbidden &&
+		hasDetail && strings.TrimSpace(detail) == "Forbidden" &&
+		hasMessage && strings.TrimSpace(message) == "HTTP 403"
 }
 
 // shouldRetryAuthHealthProbeAfterErrorLocal 判断错误是否为可重试的临时错误（如上下文超时）。
