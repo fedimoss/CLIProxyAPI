@@ -6,10 +6,10 @@ import (
 
 	"gitee.com/chunanyong/zorm"
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/entity"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/entity"
 )
 
-// ListUsers 获取用户列表
+// ListUsers 鑾峰彇鐢ㄦ埛鍒楄〃
 // ListUsers GET /v0/management/users
 func (h *Handler) ListUsers(c *gin.Context) {
 	finder := zorm.NewSelectFinder((&entity.CLIUser{}).GetTableName())
@@ -24,7 +24,7 @@ func (h *Handler) ListUsers(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": users})
 }
 
-// AddUser 添加用户
+// AddUser 娣诲姞鐢ㄦ埛
 // CreateUser POST /v0/management/users
 func (h *Handler) CreateUser(c *gin.Context) {
 	var req entity.CLIUser
@@ -50,7 +50,7 @@ func (h *Handler) CreateUser(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "data": req})
 }
 
-// UpdateUser 更新用户
+// UpdateUser 鏇存柊鐢ㄦ埛
 // UpdateUser PUT /v0/management/users
 func (h *Handler) UpdateUser(c *gin.Context) {
 	var req entity.CLIUser
@@ -73,7 +73,7 @@ func (h *Handler) UpdateUser(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
-// DeleteUser 删除用户
+// DeleteUser 鍒犻櫎鐢ㄦ埛
 // DeleteUser DELETE /v0/management/users
 func (h *Handler) DeleteUser(c *gin.Context) {
 	id := c.Query("id")

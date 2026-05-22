@@ -9,27 +9,27 @@ import (
 	"time"
 
 	"gitee.com/chunanyong/zorm"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/clioauth"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/entity"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/clioauth"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/entity"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/tidwall/gjson"
 )
 
-// DBTokenStore 基于数据库的 Token 存储实现，提供 OAuth 凭据的增删查改操作。
+// DBTokenStore 鍩轰簬鏁版嵁搴撶殑 Token 瀛樺偍瀹炵幇锛屾彁渚?OAuth 鍑嵁鐨勫鍒犳煡鏀规搷浣溿€?
 type DBTokenStore struct{}
 
-// NewDBTokenStore 创建并返回一个新的 DBTokenStore 实例。
+// NewDBTokenStore 鍒涘缓骞惰繑鍥炰竴涓柊鐨?DBTokenStore 瀹炰緥銆?
 func NewDBTokenStore() *DBTokenStore {
 	return &DBTokenStore{}
 }
 
-// SetBaseDir 设置基础目录（数据库存储模式下不使用，空实现）。
+// SetBaseDir 璁剧疆鍩虹鐩綍锛堟暟鎹簱瀛樺偍妯″紡涓嬩笉浣跨敤锛岀┖瀹炵幇锛夈€?
 func (s *DBTokenStore) SetBaseDir(_ string) {}
 
-// SkipFileAuth 返回是否跳过文件认证，数据库存储模式下始终返回 true。
+// SkipFileAuth 杩斿洖鏄惁璺宠繃鏂囦欢璁よ瘉锛屾暟鎹簱瀛樺偍妯″紡涓嬪缁堣繑鍥?true銆?
 func (s *DBTokenStore) SkipFileAuth() bool { return true }
 
-// List 从数据库查询所有认证记录。
+// List 浠庢暟鎹簱鏌ヨ鎵€鏈夎璇佽褰曘€?
 func (s *DBTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) {
 	finder := zorm.NewSelectFinder((&entity.CLIOauth{}).GetTableName())
 	finder.Append(" order by created_at desc")
@@ -50,7 +50,7 @@ func (s *DBTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) {
 	return auths, nil
 }
 
-// Save 保存认证记录到数据库，存在则更新，不存在则插入
+// Save 淇濆瓨璁よ瘉璁板綍鍒版暟鎹簱锛屽瓨鍦ㄥ垯鏇存柊锛屼笉瀛樺湪鍒欐彃鍏?
 func (s *DBTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
 	if auth == nil {
 		return "", fmt.Errorf("dbstore: auth is nil")
@@ -116,7 +116,7 @@ func (s *DBTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (strin
 	return auth.ID, nil
 }
 
-// Delete 根据ID从数据库删除认证记录
+// Delete 鏍规嵁ID浠庢暟鎹簱鍒犻櫎璁よ瘉璁板綍
 func (s *DBTokenStore) Delete(ctx context.Context, id string) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -135,7 +135,7 @@ func (s *DBTokenStore) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
-// findByID 根据ID查询认证记录
+// findByID 鏍规嵁ID鏌ヨ璁よ瘉璁板綍
 func (s *DBTokenStore) findByID(ctx context.Context, id string) (*entity.CLIOauth, error) {
 	finder := zorm.NewSelectFinder((&entity.CLIOauth{}).GetTableName())
 	finder.Append(" where id=?", id)
@@ -150,7 +150,7 @@ func (s *DBTokenStore) findByID(ctx context.Context, id string) (*entity.CLIOaut
 	return &list[0], nil
 }
 
-// rowToAuth 将数据库记录转换为运行时认证对象
+// rowToAuth 灏嗘暟鎹簱璁板綍杞崲涓鸿繍琛屾椂璁よ瘉瀵硅薄
 func (s *DBTokenStore) rowToAuth(item entity.CLIOauth) (*cliproxyauth.Auth, error) {
 	metadata := make(map[string]any)
 	if err := json.Unmarshal([]byte(item.Oauth), &metadata); err != nil {
@@ -161,7 +161,7 @@ func (s *DBTokenStore) rowToAuth(item entity.CLIOauth) (*cliproxyauth.Auth, erro
 		provider = clioauth.ModelTypeToProvider(item.ModelType)
 	}
 
-	// 将持久化的数据库状态规范化，并映射为运行时标志。
+	// 灏嗘寔涔呭寲鐨勬暟鎹簱鐘舵€佽鑼冨寲锛屽苟鏄犲皠涓鸿繍琛屾椂鏍囧織銆?
 	dbStatus := cliproxyauth.NormalizeDBStatus(item.Status)
 	disabled := false
 	unavailable := false
@@ -199,7 +199,7 @@ func (s *DBTokenStore) rowToAuth(item entity.CLIOauth) (*cliproxyauth.Auth, erro
 		NextRefreshAfter: time.Time{},
 	}
 	if dbStatus == cliproxyauth.DBStatusQuotaLimited {
-		// 数据库状态3是可恢复的，应携带配额标记。
+		// 鏁版嵁搴撶姸鎬?鏄彲鎭㈠鐨勶紝搴旀惡甯﹂厤棰濇爣璁般€?
 		auth.Quota.Exceeded = true
 		auth.Quota.Reason = "quota"
 	}

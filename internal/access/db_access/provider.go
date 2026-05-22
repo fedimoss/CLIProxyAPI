@@ -6,17 +6,17 @@ import (
 	"strings"
 
 	"gitee.com/chunanyong/zorm"
-	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
+	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
 )
 
 const providerType = "db-user-oauth"
 
-// Register 注册基于数据库 cli_user_oauth 表的认证 provider
+// Register 娉ㄥ唽鍩轰簬鏁版嵁搴?cli_user_oauth 琛ㄧ殑璁よ瘉 provider
 func Register() {
 	sdkaccess.RegisterProvider(providerType, &provider{})
 }
 
-// Unregister 注销 DB 认证 provider
+// Unregister 娉ㄩ攢 DB 璁よ瘉 provider
 func Unregister() {
 	sdkaccess.UnregisterProvider(providerType)
 }
@@ -33,7 +33,7 @@ func (p *provider) Authenticate(ctx context.Context, r *http.Request) (*sdkacces
 		return nil, sdkaccess.NewNoCredentialsError()
 	}
 
-	// 查询 cli_user_oauth 表验证 cli_user_id 是否存在
+	// 鏌ヨ cli_user_oauth 琛ㄩ獙璇?cli_user_id 鏄惁瀛樺湪
 	finder := zorm.NewSelectFinder("cli_user_oauth", "count(*)")
 	finder.Append("WHERE cli_user_id=?", apiKey)
 
@@ -50,7 +50,7 @@ func (p *provider) Authenticate(ctx context.Context, r *http.Request) (*sdkacces
 	}, nil
 }
 
-// extractAPIKey 从请求中提取 API key，支持多种 header 和 query 参数
+// extractAPIKey 浠庤姹備腑鎻愬彇 API key锛屾敮鎸佸绉?header 鍜?query 鍙傛暟
 func extractAPIKey(r *http.Request) string {
 	// Authorization: Bearer <key>
 	if auth := r.Header.Get("Authorization"); auth != "" {
@@ -60,7 +60,7 @@ func extractAPIKey(r *http.Request) string {
 				return key
 			}
 		}
-		// 直接是 key 没有 Bearer 前缀
+		// 鐩存帴鏄?key 娌℃湁 Bearer 鍓嶇紑
 		if key := strings.TrimSpace(auth); key != "" {
 			return key
 		}
