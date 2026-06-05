@@ -1266,24 +1266,27 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	return auth.Clone(), nil
 }
 
-// Update 替换已有的认证条目并通知钩子。
+// Update replaces an existing auth entry and notifies hooks.
 func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil
 	}
 	m.mu.Lock()
-	if existing, ok := m.authByIDLocked(auth.ID); ok && existing != nil {
-		if !auth.indexAssigned && auth.Index == "" {
-			auth.Index = existing.Index
-			auth.indexAssigned = existing.indexAssigned
-		}
-		auth.Success = existing.Success
-		auth.Failed = existing.Failed
-		auth.recentRequests = existing.recentRequests
-		if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
-			if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
-				auth.ModelStates = existing.ModelStates
-			}
+	existing, ok := m.authByIDLocked(auth.ID)
+	if !ok || existing == nil {
+		m.mu.Unlock()
+		return nil, nil
+	}
+	if !auth.indexAssigned && auth.Index == "" {
+		auth.Index = existing.Index
+		auth.indexAssigned = existing.indexAssigned
+	}
+	auth.Success = existing.Success
+	auth.Failed = existing.Failed
+	auth.recentRequests = existing.recentRequests
+	if !existing.Disabled && existing.Status != StatusDisabled && !auth.Disabled && auth.Status != StatusDisabled {
+		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
+			auth.ModelStates = existing.ModelStates
 		}
 	}
 	auth.EnsureIndex()
@@ -1304,7 +1307,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	return auth.Clone(), nil
 }
 
-// Load 从底层存储重置管理器状态。
+// Load resets manager state from the backing store.
 func (m *Manager) Load(ctx context.Context) error {
 	m.mu.Lock()
 	if m.store == nil {
@@ -2596,6 +2599,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 
 	m.hook.OnResult(ctx, result)
+	m.publishErrorEvent(result, authSnapshot)
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {
@@ -3659,6 +3663,19 @@ func (m *Manager) snapshotKnownAuths() []*Auth {
 		out = append(out, a.Clone())
 	}
 	return out
+}
+
+func (m *Manager) queueRefreshUnschedule(authID string) {
+	if m == nil || authID == "" {
+		return
+	}
+	m.mu.RLock()
+	loop := m.refreshLoop
+	m.mu.RUnlock()
+	if loop == nil {
+		return
+	}
+	loop.remove(authID)
 }
 
 func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {

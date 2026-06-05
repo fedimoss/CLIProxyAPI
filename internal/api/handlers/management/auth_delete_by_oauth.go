@@ -18,7 +18,7 @@ import (
 // unregisters the associated models from the global registry and purges the
 // auth from the in-memory cache.
 //
-// Query param: keyword (required) — the substring to match against cli_oauth.oauth.
+// Query param: keyword (required) - the substring to match against cli_oauth.oauth.
 //
 // This handler is intentionally standalone: it does not reuse any existing
 // helper methods so that future upstream merges remain conflict-free.
@@ -62,7 +62,7 @@ func (h *Handler) DeleteAuthByOAuth(c *gin.Context) {
 
 		// 2b. Remove from the in-memory auth cache (active + inactive + scheduler).
 		if h.authManager != nil {
-			h.authManager.Remove(id)
+			h.authManager.Remove(ctx, id)
 		}
 
 		// 2c. Delete from database in a transaction (foreign key safe).

@@ -933,7 +933,7 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 					return
 				}
 				deleted++
-				h.disableAuth(ctx, full)
+				h.removeAuth(ctx, full)
 			}
 		}
 		c.JSON(200, gin.H{"status": "ok", "deleted": deleted})
@@ -1139,9 +1139,9 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 		return filepath.Base(name), http.StatusInternalServerError, errDeleteRecord
 	}
 	if targetID != "" {
-		h.disableAuth(ctx, targetID)
+		h.removeAuth(ctx, targetID)
 	} else {
-		h.disableAuth(ctx, targetPath)
+		h.removeAuth(ctx, targetPath)
 	}
 	return filepath.Base(name), http.StatusOK, nil
 }
@@ -1917,6 +1917,25 @@ func (h *Handler) disableAuth(ctx context.Context, id string) {
 	}
 }
 
+func (h *Handler) removeAuth(ctx context.Context, id string) {
+	if h == nil || h.authManager == nil {
+		return
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return
+	}
+	if _, ok := h.authManager.GetByID(id); ok {
+		h.authManager.Remove(ctx, id)
+		return
+	}
+	authID := h.authIDForPath(id)
+	if authID == "" {
+		return
+	}
+	h.authManager.Remove(ctx, authID)
+}
+
 func (h *Handler) deleteTokenRecord(ctx context.Context, path string) error {
 	if strings.TrimSpace(path) == "" {
 		return fmt.Errorf("auth path is empty")
@@ -2014,9 +2033,9 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 		accountID = strings.TrimSpace(gjson.GetBytes(oauthJSON, "account_id").String())
 		if accountID == "" {
 		}
-		if accountID == "" {
-			return "", fmt.Errorf("model_type=1 missing account_id, unable to persist")
-		}
+		// if accountID == "" {
+		// 	return "", fmt.Errorf("model_type=1 missing account_id, unable to persist")
+		// }
 		type existingOauthRow struct {
 			ID        string     `column:"id"`
 			Status    int        `column:"status"`
