@@ -15,21 +15,21 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// DBTokenStore 鍩轰簬鏁版嵁搴撶殑 Token 瀛樺偍瀹炵幇锛屾彁渚?OAuth 鍑嵁鐨勫鍒犳煡鏀规搷浣溿€?
+// DBTokenStore stores OAuth auth records in the database.
 type DBTokenStore struct{}
 
-// NewDBTokenStore 鍒涘缓骞惰繑鍥炰竴涓柊鐨?DBTokenStore 瀹炰緥銆?
+// NewDBTokenStore creates a DB-backed token store.
 func NewDBTokenStore() *DBTokenStore {
 	return &DBTokenStore{}
 }
 
-// SetBaseDir 璁剧疆鍩虹鐩綍锛堟暟鎹簱瀛樺偍妯″紡涓嬩笉浣跨敤锛岀┖瀹炵幇锛夈€?
+// SetBaseDir is a no-op for database-backed storage.
 func (s *DBTokenStore) SetBaseDir(_ string) {}
 
-// SkipFileAuth 杩斿洖鏄惁璺宠繃鏂囦欢璁よ瘉锛屾暟鎹簱瀛樺偍妯″紡涓嬪缁堣繑鍥?true銆?
+// SkipFileAuth reports that file auth scanning should be skipped in DB mode.
 func (s *DBTokenStore) SkipFileAuth() bool { return true }
 
-// List 浠庢暟鎹簱鏌ヨ鎵€鏈夎璇佽褰曘€?
+// List returns all OAuth auth records from the database.
 func (s *DBTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) {
 	finder := zorm.NewSelectFinder((&entity.CLIOauth{}).GetTableName())
 	finder.Append(" order by created_at desc")
@@ -50,42 +50,34 @@ func (s *DBTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) {
 	return auths, nil
 }
 
-// Save 淇濆瓨璁よ瘉璁板綍鍒版暟鎹簱锛屽瓨鍦ㄥ垯鏇存柊锛屼笉瀛樺湪鍒欐彃鍏?
+// Save inserts or updates an auth record.
 func (s *DBTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
 	if auth == nil {
 		return "", fmt.Errorf("dbstore: auth is nil")
 	}
-
-	var oauthJSON []byte
-	var err error
-	if auth.Metadata != nil {
-		oauthJSON, err = json.Marshal(auth.Metadata)
-		if err != nil {
-			return "", fmt.Errorf("dbstore: marshal metadata failed: %w", err)
-		}
-	} else {
+	if auth.Metadata == nil {
 		return "", fmt.Errorf("dbstore: %s has no serializable metadata", auth.ID)
+	}
+	oauthJSON, errMarshal := json.Marshal(auth.Metadata)
+	if errMarshal != nil {
+		return "", fmt.Errorf("dbstore: marshal metadata failed: %w", errMarshal)
 	}
 
 	now := time.Now()
 	accountID := strings.TrimSpace(gjson.GetBytes(oauthJSON, "account_id").String())
 	record := entity.CLIOauth{
+		ID:        auth.ID,
 		Oauth:     string(oauthJSON),
 		ModelType: clioauth.ProviderToModelType(auth.Provider),
 		UpdatedAt: &now,
 		AccountID: accountID,
 	}
-	record.ID = auth.ID
 
-	existing, err := s.findByID(ctx, auth.ID)
-	if err != nil {
-		return "", fmt.Errorf("dbstore: query existing record failed: %w", err)
+	existing, errFind := s.findByID(ctx, auth.ID)
+	if errFind != nil {
+		return "", fmt.Errorf("dbstore: query existing record failed: %w", errFind)
 	}
-	status := cliproxyauth.DBStatusActive
-	if existing != nil && existing.Status != 0 {
-		status = cliproxyauth.NormalizeDBStatus(existing.Status)
-	}
-	status = cliproxyauth.DBStatusForAuth(auth)
+	status := cliproxyauth.DBStatusForAuth(auth)
 	record.Status = status
 	if status == cliproxyauth.DBStatusDisabled || status == cliproxyauth.DBStatusQuotaLimited {
 		record.ErrorReason = disabledErrorReason(auth)
@@ -94,7 +86,7 @@ func (s *DBTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (strin
 		}
 	}
 
-	_, err = zorm.Transaction(ctx, func(txCtx context.Context) (interface{}, error) {
+	_, errTx := zorm.Transaction(ctx, func(txCtx context.Context) (interface{}, error) {
 		if existing != nil {
 			record.CreatedAt = existing.CreatedAt
 			return zorm.Update(txCtx, &record)
@@ -102,8 +94,8 @@ func (s *DBTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (strin
 		record.CreatedAt = &now
 		return zorm.Insert(txCtx, &record)
 	})
-	if err != nil {
-		return "", fmt.Errorf("dbstore: save auth failed: %w", err)
+	if errTx != nil {
+		return "", fmt.Errorf("dbstore: save auth failed: %w", errTx)
 	}
 
 	if auth.Attributes == nil {
@@ -112,11 +104,10 @@ func (s *DBTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (strin
 	if strings.TrimSpace(auth.FileName) == "" {
 		auth.FileName = auth.ID
 	}
-
 	return auth.ID, nil
 }
 
-// Delete 鏍规嵁ID浠庢暟鎹簱鍒犻櫎璁よ瘉璁板綍
+// Delete removes an auth record by ID.
 func (s *DBTokenStore) Delete(ctx context.Context, id string) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -126,16 +117,15 @@ func (s *DBTokenStore) Delete(ctx context.Context, id string) error {
 	finder := zorm.NewDeleteFinder((&entity.CLIOauth{}).GetTableName())
 	finder.Append(" where id=?", id)
 
-	_, err := zorm.Transaction(ctx, func(txCtx context.Context) (interface{}, error) {
+	_, errTx := zorm.Transaction(ctx, func(txCtx context.Context) (interface{}, error) {
 		return zorm.UpdateFinder(txCtx, finder)
 	})
-	if err != nil {
-		return fmt.Errorf("dbstore: delete auth failed: %w", err)
+	if errTx != nil {
+		return fmt.Errorf("dbstore: delete auth failed: %w", errTx)
 	}
 	return nil
 }
 
-// findByID 鏍规嵁ID鏌ヨ璁よ瘉璁板綍
 func (s *DBTokenStore) findByID(ctx context.Context, id string) (*entity.CLIOauth, error) {
 	finder := zorm.NewSelectFinder((&entity.CLIOauth{}).GetTableName())
 	finder.Append(" where id=?", id)
@@ -150,7 +140,6 @@ func (s *DBTokenStore) findByID(ctx context.Context, id string) (*entity.CLIOaut
 	return &list[0], nil
 }
 
-// rowToAuth 灏嗘暟鎹簱璁板綍杞崲涓鸿繍琛屾椂璁よ瘉瀵硅薄
 func (s *DBTokenStore) rowToAuth(item entity.CLIOauth) (*cliproxyauth.Auth, error) {
 	metadata := make(map[string]any)
 	if err := json.Unmarshal([]byte(item.Oauth), &metadata); err != nil {
@@ -161,7 +150,6 @@ func (s *DBTokenStore) rowToAuth(item entity.CLIOauth) (*cliproxyauth.Auth, erro
 		provider = clioauth.ModelTypeToProvider(item.ModelType)
 	}
 
-	// 灏嗘寔涔呭寲鐨勬暟鎹簱鐘舵€佽鑼冨寲锛屽苟鏄犲皠涓鸿繍琛屾椂鏍囧織銆?
 	dbStatus := cliproxyauth.NormalizeDBStatus(item.Status)
 	disabled := false
 	unavailable := false
@@ -174,11 +162,12 @@ func (s *DBTokenStore) rowToAuth(item entity.CLIOauth) (*cliproxyauth.Auth, erro
 		status = cliproxyauth.StatusError
 		unavailable = true
 	default:
-		if d, ok := metadata["disabled"].(bool); ok && d {
+		if disabledMeta, _ := metadata["disabled"].(bool); disabledMeta {
 			disabled = true
 			status = cliproxyauth.StatusDisabled
 		}
 	}
+
 	attr := map[string]string{"path": item.ID}
 	if email := strings.TrimSpace(valueAsString(metadata["email"])); email != "" {
 		attr["email"] = email
@@ -199,7 +188,6 @@ func (s *DBTokenStore) rowToAuth(item entity.CLIOauth) (*cliproxyauth.Auth, erro
 		NextRefreshAfter: time.Time{},
 	}
 	if dbStatus == cliproxyauth.DBStatusQuotaLimited {
-		// 鏁版嵁搴撶姸鎬?鏄彲鎭㈠鐨勶紝搴旀惡甯﹂厤棰濇爣璁般€?
 		auth.Quota.Exceeded = true
 		auth.Quota.Reason = "quota"
 	}
@@ -224,12 +212,11 @@ func (s *DBTokenStore) rowToAuth(item entity.CLIOauth) (*cliproxyauth.Auth, erro
 		auth.UpdatedAt = *item.UpdatedAt
 	}
 	if (disabled || dbStatus == cliproxyauth.DBStatusQuotaLimited) && strings.TrimSpace(item.ErrorReason) != "" {
-		rawReason := strings.TrimSpace(item.ErrorReason)
-		auth.StatusMessage = rawReason
+		auth.StatusMessage = strings.TrimSpace(item.ErrorReason)
 	}
-
 	return auth, nil
 }
+
 func disabledErrorReason(auth *cliproxyauth.Auth) string {
 	if auth == nil {
 		return ""
@@ -241,9 +228,11 @@ func disabledErrorReason(auth *cliproxyauth.Auth) string {
 	}
 	return ""
 }
+
 func providerToModelType(provider string) int {
 	return clioauth.ProviderToModelType(provider)
 }
+
 func modelTypeToProvider(modelType int) string {
 	return clioauth.ModelTypeToProvider(modelType)
 }

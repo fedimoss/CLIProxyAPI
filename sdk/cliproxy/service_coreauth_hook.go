@@ -6,13 +6,13 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
-// serviceCoreAuthHook 灏嗘牳蹇冭璇佺敓鍛藉懆鏈熶簨浠朵腑缁у埌鏈嶅姟杩愯鏃跺悓姝ャ€?
+// serviceCoreAuthHook bridges core auth lifecycle events into service runtime sync.
 type serviceCoreAuthHook struct {
 	next    coreauth.Hook
 	service *Service
 }
 
-// OnAuthRegistered 閫氳繃閽╁瓙閾捐浆鍙戞敞鍐屼簨浠躲€?
+// OnAuthRegistered forwards registration events.
 func (h *serviceCoreAuthHook) OnAuthRegistered(ctx context.Context, auth *coreauth.Auth) {
 	if h == nil {
 		return
@@ -22,7 +22,7 @@ func (h *serviceCoreAuthHook) OnAuthRegistered(ctx context.Context, auth *coreau
 	}
 }
 
-// OnAuthUpdated 杞彂浜嬩欢骞惰Е鍙戣繍琛屾椂娉ㄥ唽鍗忚皟銆?
+// OnAuthUpdated forwards update events and reconciles runtime registration.
 func (h *serviceCoreAuthHook) OnAuthUpdated(ctx context.Context, auth *coreauth.Auth) {
 	if h == nil {
 		return
@@ -35,7 +35,7 @@ func (h *serviceCoreAuthHook) OnAuthUpdated(ctx context.Context, auth *coreauth.
 	}
 }
 
-// OnResult 閫氳繃閽╁瓙閾捐浆鍙戞墽琛岀粨鏋溿€?
+// OnResult forwards execution result events.
 func (h *serviceCoreAuthHook) OnResult(ctx context.Context, result coreauth.Result) {
 	if h == nil {
 		return
@@ -45,7 +45,7 @@ func (h *serviceCoreAuthHook) OnResult(ctx context.Context, result coreauth.Resu
 	}
 }
 
-// attachCoreAuthHook 鍦?coreManager 涓婂畨瑁呮湇鍔℃劅鐭ョ殑閽╁瓙鍖呰鍣ㄣ€?
+// attachCoreAuthHook installs the service-aware hook on the core manager.
 func (s *Service) attachCoreAuthHook() {
 	if s == nil || s.coreManager == nil {
 		return
@@ -60,20 +60,16 @@ func (s *Service) attachCoreAuthHook() {
 	})
 }
 
-// reconcileRuntimeAuthRegistration 淇濇寔鏈嶅姟杩愯鏃舵敞鍐岀殑鍚屾銆?
+// reconcileRuntimeAuthRegistration keeps model registrations aligned with auth status.
 func (s *Service) reconcileRuntimeAuthRegistration(auth *coreauth.Auth) {
 	if s == nil || s.coreManager == nil || auth == nil || auth.ID == "" {
 		return
 	}
 	if !coreauth.IsAuthActiveForRouting(auth) {
-		// 褰撹璇佷笉鍙矾鐢辨椂锛屽皢鍏朵粠鍏ㄥ眬妯″瀷娉ㄥ唽琛ㄤ腑娉ㄩ攢銆?
 		GlobalModelRegistry().UnregisterClient(auth.ID)
 		s.coreManager.RefreshSchedulerEntry(auth.ID)
 		return
 	}
-	// 褰撹璇佸彲璺敱鏃讹紝鎭㈠鎵ц鍣?妯″瀷鍜岃皟搴﹀櫒鐘舵€併€?
 	s.ensureExecutorsForAuth(auth)
-	s.registerModelsForAuth(auth)
-	s.coreManager.ReconcileRegistryModelStates(context.Background(), auth.ID)
-	s.coreManager.RefreshSchedulerEntry(auth.ID)
+	s.completeModelRegistrationForAuth(context.Background(), auth)
 }

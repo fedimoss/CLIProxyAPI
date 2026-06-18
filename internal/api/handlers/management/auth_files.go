@@ -37,8 +37,10 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/synthesizer"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"golang.org/x/oauth2"
@@ -246,7 +248,82 @@ func (h *Handler) managementCallbackURL(path string) (string, error) {
 	return fmt.Sprintf("%s://127.0.0.1:%d%s", scheme, h.cfg.Port, path), nil
 }
 
-// ListAuthFiles 返回所有认证文件列表
+func pluginAuthProviderFromPath(path string) (string, bool) {
+	path = strings.TrimSpace(path)
+	const prefix = "/v0/management/"
+	const suffix = "-auth-url"
+	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+		return "", false
+	}
+	provider := strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix)
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" {
+		return "", false
+	}
+	for _, r := range provider {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9':
+		case r == '-':
+		default:
+			return "", false
+		}
+	}
+	return provider, true
+}
+
+func (h *Handler) ServePluginAuthURL(c *gin.Context) bool {
+	if h == nil || c == nil || c.Request == nil || c.Request.URL == nil {
+		return false
+	}
+	h.mu.Lock()
+	host := h.pluginHost
+	h.mu.Unlock()
+	if host == nil {
+		return false
+	}
+	provider, ok := pluginAuthProviderFromPath(c.Request.URL.Path)
+	if !ok || !host.HasAuthProvider(provider) {
+		return false
+	}
+
+	ctx := PopulateAuthContext(context.Background(), c)
+	baseURL, errBaseURL := h.managementCallbackURL("/v0/management/oauth-callback")
+	if errBaseURL != nil {
+		log.WithError(errBaseURL).Error("failed to compute plugin auth callback URL")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
+		return true
+	}
+	resp, handled, errStart := host.StartLogin(ctx, provider, baseURL)
+	if !handled {
+		return false
+	}
+	if errStart != nil {
+		log.WithError(errStart).Error("failed to start plugin auth login")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
+		return true
+	}
+	state := strings.TrimSpace(resp.State)
+	if state == "" {
+		log.WithField("provider", provider).Error("plugin auth provider returned empty state")
+		c.JSON(http.StatusBadGateway, gin.H{"error": "invalid oauth state"})
+		return true
+	}
+	if errState := ValidateOAuthState(state); errState != nil {
+		log.WithError(errState).WithField("provider", provider).Error("plugin auth provider returned invalid state")
+		c.JSON(http.StatusBadGateway, gin.H{"error": "invalid oauth state"})
+		return true
+	}
+	if errRegister := RegisterPluginOAuthSession(state, provider, resp.Metadata); errRegister != nil {
+		log.WithError(errRegister).WithField("provider", provider).Error("failed to register plugin oauth session")
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to generate authorization url"})
+		return true
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "url": resp.URL, "state": state})
+	return true
+}
+
+// ListAuthFiles returns all auth file entries.
 func (h *Handler) ListAuthFiles(c *gin.Context) {
 	if h == nil {
 		c.JSON(500, gin.H{"error": "handler not initialized"})
@@ -1394,21 +1471,35 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	if authID == "" {
 		authID = path
 	}
-	attr := map[string]string{
-		"path":   path,
-		"source": path,
+	auth := (*coreauth.Auth)(nil)
+	if h != nil && h.cfg != nil {
+		sctx := &synthesizer.SynthesisContext{
+			Config:      h.cfg,
+			AuthDir:     h.cfg.AuthDir,
+			Now:         time.Now(),
+			IDGenerator: synthesizer.NewStableIDGenerator(),
+		}
+		if generated := synthesizer.SynthesizeAuthFile(sctx, path, data); len(generated) > 0 && generated[0] != nil {
+			auth = generated[0].Clone()
+		}
 	}
-	auth := &coreauth.Auth{
-		ID:         authID,
-		Provider:   provider,
-		FileName:   filepath.Base(path),
-		Label:      label,
-		Status:     coreauth.StatusActive,
-		Attributes: attr,
-		Metadata:   metadata,
-		CreatedAt:  time.Now(),
-		UpdatedAt:  time.Now(),
+	if auth == nil {
+		auth = &coreauth.Auth{
+			ID:       authID,
+			Provider: provider,
+			Label:    label,
+			Status:   coreauth.StatusActive,
+			Attributes: map[string]string{
+				"path":   path,
+				"source": path,
+			},
+			Metadata:  metadata,
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		}
 	}
+	auth.ID = authID
+	auth.FileName = filepath.Base(path)
 	if hasLastRefresh {
 		auth.LastRefreshedAt = lastRefresh
 	}
@@ -1487,7 +1578,37 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		return
 	}
 
-	// 通过共享的认证状态辅助函数更新禁用状态。
+	if coreauth.IsConfigAPIKeyAuth(targetAuth) {
+		h.mu.Lock()
+		handled, errToggle := toggleConfigAPIKeyExcludedAll(h.cfg, targetAuth, *req.Disabled)
+		if errToggle != nil {
+			h.mu.Unlock()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update config api key: %v", errToggle)})
+			return
+		}
+		if !handled {
+			h.mu.Unlock()
+			c.JSON(http.StatusNotFound, gin.H{"error": "config api key entry not found"})
+			return
+		}
+		cfgSnapshot, okSnapshot := h.saveConfigAndSnapshotLocked(c)
+		h.mu.Unlock()
+		if !okSnapshot {
+			return
+		}
+		h.reloadConfigAfterManagementSave(ctx, cfgSnapshot)
+		if h.tokenStore != nil {
+			_ = h.tokenStore.Delete(ctx, targetAuth.ID)
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"status":           "ok",
+			"disabled":         *req.Disabled,
+			"via":              "config:excluded-models",
+			"excluded_pattern": configAPIKeyDisablePattern,
+		})
+		return
+	}
+
 	if *req.Disabled {
 		coreauth.ApplyManualDisabled(targetAuth, "disabled via management API", time.Now())
 	} else {
@@ -1977,43 +2098,37 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 			return "", fmt.Errorf("post-auth hook failed: %w", err)
 		}
 	}
-
-	// 将 OAuth 令牌序列化为 JSON（内容与原始 JSON 文件相同）
-	var oauthJSON []byte
-	var err error
-	switch {
-	case record.Storage != nil:
-		type metadataGetter interface {
-			SetMetadata(map[string]any)
+	if h != nil && h.cfg != nil && strings.TrimSpace(h.cfg.Database.DSN) != "" {
+		oauthID, cacheRecord, errSave := h.saveTokenRecordToDatabase(ctx, record)
+		if errSave != nil {
+			return "", errSave
 		}
-		if setter, ok := record.Storage.(metadataGetter); ok && record.Metadata != nil {
-			setter.SetMetadata(record.Metadata)
+		if cacheRecord != nil {
+			if errHook := h.runPostPersistHooks(coreauth.WithSkipPersist(ctx), oauthID, cacheRecord); errHook != nil {
+				return oauthID, errHook
+			}
 		}
-		merged, errMerge := misc.MergeMetadata(record.Storage, record.Metadata)
-		if errMerge != nil {
-			return "", fmt.Errorf("merge metadata failed: %w", errMerge)
-		}
-		// Ensure the "type" field is set, mirroring what each SaveTokenToFile() does.
-		// The struct's Type field may be zero-valued (""), so override it with the provider name.
-		if record.Provider != "" {
-			merged["type"] = record.Provider
-		}
-		oauthJSON, err = json.Marshal(merged)
-		if err != nil {
-			return "", fmt.Errorf("marshal oauth token failed: %w", err)
-		}
-	case record.Metadata != nil:
-		// Mirror filestore.Save: inject "disabled" into metadata before marshalling.
-		record.Metadata["disabled"] = record.Disabled
-		oauthJSON, err = json.Marshal(record.Metadata)
-		if err != nil {
-			return "", fmt.Errorf("marshal oauth metadata failed: %w", err)
-		}
-	default:
-		return "", fmt.Errorf("nothing to persist for %s", record.ID)
+		return oauthID, nil
 	}
 
-	// Determine model type from provider
+	savedPath, errSave := store.Save(ctx, record)
+	if errSave != nil {
+		return "", errSave
+	}
+	if h.postAuthPersistHook != nil {
+		if errHook := h.postAuthPersistHook(ctx, record); errHook != nil {
+			return savedPath, fmt.Errorf("post-auth persist hook failed: %w", errHook)
+		}
+	}
+	return savedPath, nil
+}
+
+func (h *Handler) saveTokenRecordToDatabase(ctx context.Context, record *coreauth.Auth) (string, *coreauth.Auth, error) {
+	oauthJSON, errJSON := authRecordJSON(record)
+	if errJSON != nil {
+		return "", nil, errJSON
+	}
+
 	modelType := clioauth.ProviderToModelType(record.Provider)
 	now := time.Now()
 	oauthID := fmt.Sprintf("oauth_%d", now.UnixNano())
@@ -2033,16 +2148,14 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 		accountID = strings.TrimSpace(gjson.GetBytes(oauthJSON, "account_id").String())
 	}
 
-	// Save to cli_oauth and cli_user_oauth in a single transaction
-	_, err = zorm.Transaction(ctx, func(txCtx context.Context) (interface{}, error) {
-		// Insert cli_oauth record
+	_, errTx := zorm.Transaction(ctx, func(txCtx context.Context) (interface{}, error) {
 		oauthRecord := &entity.CLIOauth{
 			ID:          oauthID,
 			Oauth:       string(oauthJSON),
 			ModelType:   modelType,
 			AccountID:   accountID,
 			ErrorReason: "",
-			Status:      1,
+			Status:      coreauth.DBStatusForAuth(record),
 			CreatedAt:   &now,
 			UpdatedAt:   &now,
 		}
@@ -2050,58 +2163,108 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 			return nil, fmt.Errorf("insert cli_oauth failed: %w", errInsert)
 		}
 
-		// Insert cli_user_oauth record
-		userOauthID := fmt.Sprintf("uo_%d", now.UnixNano())
 		userOauthRecord := &entity.CLIUserOauth{
-			ID:         userOauthID,
+			ID:         fmt.Sprintf("uo_%d", now.UnixNano()),
 			CliUserId:  cliUserID,
 			CliOauthId: oauthID,
 		}
 		if _, errInsert := zorm.Insert(txCtx, userOauthRecord); errInsert != nil {
 			return nil, fmt.Errorf("insert cli_user_oauth failed: %w", errInsert)
 		}
-
 		return nil, nil
 	})
-	if err != nil {
-		return "", fmt.Errorf("save oauth to database failed: %w", err)
+	if errTx != nil {
+		return "", nil, fmt.Errorf("save oauth to database failed: %w", errTx)
 	}
 
 	log.Infof("OAuth saved to database: cli_oauth.id=%s, cli_user_id=%s, provider=%s", oauthID, cliUserID, record.Provider)
+	cacheRecord, errCache := buildDatabaseCacheAuth(record, oauthID, oauthJSON, now)
+	if errCache != nil {
+		log.Warnf("OAuth saved to DB but failed to build runtime cache: %v", errCache)
+		return oauthID, nil, nil
+	}
 	if h.authManager != nil {
-		fullMetadata := make(map[string]any)
-		if errUnmarshal := json.Unmarshal(oauthJSON, &fullMetadata); errUnmarshal != nil {
-			log.Warnf("OAuth saved to DB but failed to unmarshal for cache: %v", errUnmarshal)
-			return oauthID, nil
-		}
-
-		cacheRecord := &coreauth.Auth{
-			ID:        oauthID,
-			Provider:  record.Provider,
-			FileName:  oauthID,
-			Label:     record.Label,
-			Status:    record.Status,
-			Disabled:  record.Disabled,
-			Storage:   record.Storage,
-			Metadata:  fullMetadata,
-			CreatedAt: now,
-			UpdatedAt: now,
-			Attributes: map[string]string{
-				"path": oauthID,
-			},
-		}
-		if email := strings.TrimSpace(valueAsString(fullMetadata["email"])); email != "" {
-			cacheRecord.Attributes["email"] = email
-		}
-		regCtx := coreauth.WithSkipPersist(ctx)
-		if _, errReg := h.authManager.Register(regCtx, cacheRecord); errReg != nil {
+		if _, errReg := h.authManager.Register(coreauth.WithSkipPersist(ctx), cacheRecord); errReg != nil {
 			log.Warnf("OAuth saved to DB but failed to register in memory: %v", errReg)
-		} else if h.postRegisterHook != nil {
-			h.postRegisterHook(regCtx, cacheRecord)
 		}
 	}
+	return oauthID, cacheRecord, nil
+}
 
-	return oauthID, nil
+func authRecordJSON(record *coreauth.Auth) ([]byte, error) {
+	switch {
+	case record.Storage != nil:
+		type metadataSetter interface {
+			SetMetadata(map[string]any)
+		}
+		if setter, ok := record.Storage.(metadataSetter); ok && record.Metadata != nil {
+			setter.SetMetadata(record.Metadata)
+		}
+		merged, errMerge := misc.MergeMetadata(record.Storage, record.Metadata)
+		if errMerge != nil {
+			return nil, fmt.Errorf("merge metadata failed: %w", errMerge)
+		}
+		if record.Provider != "" {
+			merged["type"] = record.Provider
+		}
+		oauthJSON, errMarshal := json.Marshal(merged)
+		if errMarshal != nil {
+			return nil, fmt.Errorf("marshal oauth token failed: %w", errMarshal)
+		}
+		return oauthJSON, nil
+	case record.Metadata != nil:
+		record.Metadata["disabled"] = record.Disabled
+		oauthJSON, errMarshal := json.Marshal(record.Metadata)
+		if errMarshal != nil {
+			return nil, fmt.Errorf("marshal oauth metadata failed: %w", errMarshal)
+		}
+		return oauthJSON, nil
+	default:
+		return nil, fmt.Errorf("nothing to persist for %s", record.ID)
+	}
+}
+
+func buildDatabaseCacheAuth(record *coreauth.Auth, oauthID string, oauthJSON []byte, now time.Time) (*coreauth.Auth, error) {
+	fullMetadata := make(map[string]any)
+	if errUnmarshal := json.Unmarshal(oauthJSON, &fullMetadata); errUnmarshal != nil {
+		return nil, errUnmarshal
+	}
+	cacheRecord := &coreauth.Auth{
+		ID:        oauthID,
+		Provider:  record.Provider,
+		FileName:  oauthID,
+		Label:     record.Label,
+		Status:    record.Status,
+		DBStatus:  coreauth.DBStatusForAuth(record),
+		Disabled:  record.Disabled,
+		Storage:   record.Storage,
+		Metadata:  fullMetadata,
+		CreatedAt: now,
+		UpdatedAt: now,
+		Attributes: map[string]string{
+			"path": oauthID,
+		},
+	}
+	if email := strings.TrimSpace(valueAsString(fullMetadata["email"])); email != "" {
+		cacheRecord.Attributes["email"] = email
+	}
+	return cacheRecord, nil
+}
+
+func (h *Handler) runPostPersistHooks(ctx context.Context, savedPath string, auth *coreauth.Auth) error {
+	if h == nil || auth == nil {
+		return nil
+	}
+	if h.postAuthPersistHook != nil {
+		if errHook := h.postAuthPersistHook(ctx, auth); errHook != nil {
+			return fmt.Errorf("post-auth persist hook failed for %s: %w", savedPath, errHook)
+		}
+		return nil
+	}
+	if h.postRegisterHook != nil {
+		h.postRegisterHook(ctx, auth)
+	}
+	return nil
 }
 
 func (h *Handler) RequestAnthropicToken(c *gin.Context) {
@@ -3452,7 +3615,7 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 		return
 	}
 
-	_, status, ok := GetOAuthSession(state)
+	provider, status, isPlugin, metadata, ok := GetOAuthSessionDetails(state)
 	if !ok {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 		return
@@ -3460,6 +3623,56 @@ func (h *Handler) GetAuthStatus(c *gin.Context) {
 	if status != "" {
 		c.JSON(http.StatusOK, gin.H{"status": "error", "error": status})
 		return
+	}
+	h.mu.Lock()
+	host := h.pluginHost
+	h.mu.Unlock()
+	if isPlugin && host != nil && host.HasAuthProvider(provider) {
+		ctx := PopulateAuthContext(context.Background(), c)
+		resp, handled, errPoll := host.PollLogin(ctx, provider, state, metadata)
+		if handled {
+			if errPoll != nil {
+				message := strings.TrimSpace(errPoll.Error())
+				if message == "" {
+					message = "Authentication failed"
+				}
+				SetOAuthSessionError(state, message)
+				c.JSON(http.StatusOK, gin.H{"status": "error", "error": message})
+				return
+			}
+			switch resp.Status {
+			case "", pluginapi.AuthLoginStatusPending:
+				c.JSON(http.StatusOK, gin.H{"status": "wait"})
+				return
+			case pluginapi.AuthLoginStatusError:
+				message := strings.TrimSpace(resp.Message)
+				if message == "" {
+					message = "Authentication failed"
+				}
+				SetOAuthSessionError(state, message)
+				c.JSON(http.StatusOK, gin.H{"status": "error", "error": message})
+				return
+			case pluginapi.AuthLoginStatusSuccess:
+				record := host.AuthDataToCoreAuth(resp.Auth, "", "")
+				if record == nil {
+					SetOAuthSessionError(state, "Authentication failed")
+					c.JSON(http.StatusOK, gin.H{"status": "error", "error": "Authentication failed"})
+					return
+				}
+				if _, errSave := h.saveTokenRecord(ctx, record); errSave != nil {
+					log.WithError(errSave).WithField("provider", provider).Error("failed to save plugin auth tokens")
+					SetOAuthSessionError(state, "Failed to save authentication tokens")
+					c.JSON(http.StatusOK, gin.H{"status": "error", "error": "Failed to save authentication tokens"})
+					return
+				}
+				CompleteOAuthSession(state)
+				c.JSON(http.StatusOK, gin.H{"status": "ok"})
+				return
+			default:
+				c.JSON(http.StatusOK, gin.H{"status": "wait"})
+				return
+			}
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "wait"})
 }
