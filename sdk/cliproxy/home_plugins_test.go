@@ -6,7 +6,6 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
-	"gopkg.in/yaml.v3"
 )
 
 func TestSyncHomePluginsSkipsUnchangedSignature(t *testing.T) {
@@ -34,44 +33,29 @@ func TestSyncHomePluginsSkipsUnchangedSignature(t *testing.T) {
 	}
 }
 
-func TestApplyHomeOverlayWarnsOnRuntimePluginSyncFailure(t *testing.T) {
+func TestApplyHomeOverlayAppliesMergedConfig(t *testing.T) {
 	base := &config.Config{}
 	base.Home.Enabled = true
 	base.Plugins.Enabled = true
 	service := &Service{cfg: base}
 
-	enabled := true
+	// applyHomeOverlay merges the remote config into the base (preserving the
+	// base Host/Port/TLS/Home) and applies it. It no longer synchronizes
+	// plugins, so a remote config cannot trigger a plugin-sync failure here.
 	remote := &config.Config{}
 	remote.Plugins.Enabled = true
-	remote.Plugins.Configs = map[string]config.PluginInstanceConfig{
-		"broken": {
-			Enabled: &enabled,
-			Raw: yaml.Node{
-				Kind: yaml.MappingNode,
-				Tag:  "!!map",
-				Content: []*yaml.Node{
-					{Kind: yaml.ScalarNode, Tag: "!!str", Value: "store"},
-					{
-						Kind: yaml.MappingNode,
-						Tag:  "!!map",
-						Content: []*yaml.Node{
-							{Kind: yaml.ScalarNode, Tag: "!!str", Value: "id"},
-							{Kind: yaml.ScalarNode, Tag: "!!str", Value: "broken"},
-						},
-					},
-				},
-			},
-		},
-	}
+	remote.Plugins.Configs = map[string]config.PluginInstanceConfig{}
 
-	if errApply := service.applyHomeOverlayContext(context.Background(), remote); errApply != nil {
-		t.Fatalf("applyHomeOverlayContext() error = %v, want warning-only plugin sync failure", errApply)
+	service.applyHomeOverlay(remote)
+
+	if service.cfg == nil || !service.cfg.Home.Enabled {
+		t.Fatalf("service cfg = %+v, want base home config preserved after overlay", service.cfg)
 	}
-	if service.cfg == nil || !service.cfg.Home.Enabled || !service.cfg.Plugins.Enabled {
-		t.Fatalf("service cfg = %+v, want applied home config despite plugin sync failure", service.cfg)
+	if service.cfg == nil || !service.cfg.Plugins.Enabled {
+		t.Fatalf("service cfg = %+v, want remote plugins config applied by overlay", service.cfg)
 	}
 	if service.homePluginSyncKey != "" {
-		t.Fatalf("homePluginSyncKey = %q, want empty after plugin sync failure", service.homePluginSyncKey)
+		t.Fatalf("homePluginSyncKey = %q, want empty; applyHomeOverlay does not sync plugins", service.homePluginSyncKey)
 	}
 }
 
