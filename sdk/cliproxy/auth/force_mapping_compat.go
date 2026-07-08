@@ -27,6 +27,10 @@ func (m *Manager) resolveAPIKeyModelAliasWithResult(auth *Auth, requestedModel s
 		if entry := resolveGeminiAPIKeyConfig(cfg, auth); entry != nil {
 			models = asModelAliasEntries(entry.Models)
 		}
+	case "gemini-interactions":
+		if entry := resolveInteractionsAPIKeyConfig(cfg, auth); entry != nil {
+			models = asModelAliasEntries(entry.Models)
+		}
 	case "claude":
 		if entry := resolveClaudeAPIKeyConfig(cfg, auth); entry != nil {
 			models = asModelAliasEntries(entry.Models)
