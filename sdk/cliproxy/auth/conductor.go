@@ -634,13 +634,13 @@ func openAICompatProviderKey(auth *Auth) string {
 	}
 	if auth.Attributes != nil {
 		if providerKey := strings.TrimSpace(auth.Attributes["provider_key"]); providerKey != "" {
-			return strings.ToLower(providerKey)
+			return util.OpenAICompatibleProviderKey(providerKey)
 		}
 		if compatName := strings.TrimSpace(auth.Attributes["compat_name"]); compatName != "" {
-			return strings.ToLower(compatName)
+			return util.OpenAICompatibleProviderKey(compatName)
 		}
 	}
-	return strings.ToLower(strings.TrimSpace(auth.Provider))
+	return util.OpenAICompatibleProviderKey(auth.Provider)
 }
 
 func openAICompatModelPoolKey(auth *Auth, requestedModel string) string {
@@ -2853,7 +2853,7 @@ func (m *Manager) closestCooldownWait(providers []string, model string, attempt 
 		if auth == nil {
 			continue
 		}
-		providerKey := strings.TrimSpace(strings.ToLower(auth.Provider))
+		providerKey := executorKeyFromAuth(auth)
 		if _, ok := providerSet[providerKey]; !ok {
 			continue
 		}
@@ -2913,7 +2913,7 @@ func (m *Manager) retryAllowed(attempt int, providers []string) bool {
 		if auth == nil {
 			continue
 		}
-		providerKey := strings.TrimSpace(strings.ToLower(auth.Provider))
+		providerKey := executorKeyFromAuth(auth)
 		if _, ok := providerSet[providerKey]; !ok {
 			continue
 		}
@@ -4043,7 +4043,7 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 		if !strings.Contains(strings.ToLower(strings.TrimSpace(routeModel)), "claude") {
 			continue
 		}
-		providerKey := strings.TrimSpace(strings.ToLower(auth.Provider))
+		providerKey := executorKeyFromAuth(auth)
 		executor, ok := m.executors[providerKey]
 		if !ok {
 			continue
@@ -4615,7 +4615,7 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	var exec ProviderExecutor
 	var cloned *Auth
 	if auth != nil {
-		exec = m.executors[auth.Provider]
+		exec = m.executors[executorKeyFromAuth(auth)]
 		cloned = auth.Clone()
 	}
 	m.mu.RUnlock()
@@ -4677,7 +4677,7 @@ func (m *Manager) refreshAuthForHealthProbe(ctx context.Context, id string) (*Au
 	auth, ok := m.authByIDLocked(id)
 	var exec ProviderExecutor
 	if ok && auth != nil {
-		exec = m.executors[auth.Provider]
+		exec = m.executors[executorKeyFromAuth(auth)]
 	}
 	m.mu.RUnlock()
 
@@ -4752,8 +4752,15 @@ func executorKeyFromAuth(auth *Auth) string {
 			if providerKey == "" {
 				providerKey = compatName
 			}
-			return strings.ToLower(providerKey)
+			return util.OpenAICompatibleProviderKey(providerKey)
 		}
+	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "openai-compatibility") {
+		providerKey := strings.TrimSpace(auth.Label)
+		if providerKey == "" {
+			providerKey = "openai-compatibility"
+		}
+		return util.OpenAICompatibleProviderKey(providerKey)
 	}
 	return strings.ToLower(strings.TrimSpace(auth.Provider))
 }

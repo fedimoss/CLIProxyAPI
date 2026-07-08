@@ -71,7 +71,7 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 	}
 	registryRef := registry.GetGlobalRegistry()
 	for _, candidate := range m.auths {
-		if candidate.Provider != provider || candidate.Disabled {
+		if candidate == nil || executorKeyFromAuth(candidate) != provider || candidate.Disabled {
 			continue
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
@@ -230,7 +230,7 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		if disallowFreeAuth && isFreeCodexAuth(candidate) {
 			continue
 		}
-		providerKey := strings.TrimSpace(strings.ToLower(candidate.Provider))
+		providerKey := executorKeyFromAuth(candidate)
 		if providerKey == "" {
 			continue
 		}
