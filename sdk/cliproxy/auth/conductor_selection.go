@@ -472,11 +472,13 @@ func repeatedHomeAuthError() *Error {
 }
 
 type homeAuthDispatchResponse struct {
-	Model      string `json:"model"`
-	Provider   string `json:"provider"`
-	AuthIndex  string `json:"auth_index"`
-	UserAPIKey string `json:"user_api_key"`
-	Auth       Auth   `json:"auth"`
+	Model         string `json:"model"`
+	Provider      string `json:"provider"`
+	AuthIndex     string `json:"auth_index"`
+	UserAPIKey    string `json:"user_api_key"`
+	Auth          Auth   `json:"auth"`
+	OriginalAlias string `json:"original_alias"`
+	ForceMapping  bool   `json:"force_mapping"`
 }
 
 type homeAuthDispatcher interface {
@@ -741,6 +743,15 @@ func (m *Manager) pickNextViaHome(ctx context.Context, model string, opts clipro
 			auth.Attributes = make(map[string]string, 1)
 		}
 		auth.Attributes[homeUpstreamModelAttributeKey] = upstreamModel
+	}
+	// home 强制映射:把上游返回的 original_alias / force_mapping 记到 auth 属性上,
+	// 供后续 homeForceMappingAliasResult 读取并回写响应模型名(合并时从上游补回)。
+	if originalAlias := strings.TrimSpace(dispatch.OriginalAlias); dispatch.ForceMapping && originalAlias != "" {
+		if auth.Attributes == nil {
+			auth.Attributes = make(map[string]string, 2)
+		}
+		auth.Attributes[homeForceMappingAttributeKey] = "true"
+		auth.Attributes[homeOriginalAliasAttributeKey] = originalAlias
 	}
 	if strings.TrimSpace(auth.ID) == "" {
 		return nil, nil, "", &Error{Code: "invalid_auth", Message: "home returned auth without id", HTTPStatus: http.StatusBadGateway}
