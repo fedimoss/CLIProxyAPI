@@ -38,7 +38,7 @@ require (
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/redis/go-redis/v9 v9.19.0 // indirect
+	github.com/redis/go-redis/v9 v9.19.0
 	go.uber.org/atomic v1.11.0 // indirect
 )
 
@@ -112,5 +112,4 @@ require (
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/arch v0.22.0 // indirect
 	golang.org/x/text v0.36.0 // indirect
-	gopkg.in/ini.v1 v1.67.0 // indirect
 )

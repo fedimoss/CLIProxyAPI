@@ -336,7 +336,7 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		h.listAuthFilesFromDisk(c)
 		return
 	}
-	auths := h.authManager.List()
+	auths := h.authManager.ListAll()
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
 		if entry := h.buildAuthFileEntry(auth); entry != nil {
@@ -416,7 +416,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 			continue
 		}
 		if info, errInfo := e.Info(); errInfo == nil {
-			fileData := gin.H{"name": name, "size": info.Size(), "modtime": info.ModTime()}
+			fileData := gin.H{"name": name, "size": info.Size(), "modtime": info.ModTime(), "db_status": 1}
 
 			// 读取文件以获取 type 字段
 			full := filepath.Join(h.cfg.AuthDir, name)
@@ -463,6 +463,27 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 	c.JSON(200, gin.H{"files": files})
 }
 
+// managementDBStatus 直接返回认证的内部 DB status，不做任何重映射。
+// 控制面板按这些原始值筛选：
+//   - active (DBStatusActive)              -> 1（启用）
+//   - disabled (DBStatusDisabled)          -> 2（问题：账号出问题/永久失败）
+//   - quota-limited (DBStatusQuotaLimited) -> 3（停用：额度不足 或 手动停用）
+//
+// 内部 auth-health 常量与路由/冷却/恢复行为不变，API 以 1:1 透传持久化的 status，
+// 使 UI 约定（2=问题，3=停用）与存储层一致。
+func managementDBStatus(auth *coreauth.Auth) int {
+	return coreauth.NormalizeDBStatus(coreauth.DBStatusForAuth(auth))
+}
+
+// managementDBStatusFromDisabled 根据开关请求的 disabled 标志推导展示状态，
+// 用于开关接口的响应。手动停用对应 status=3（与额度不足同桶），启用对应 status=1。
+func managementDBStatusFromDisabled(disabled bool) int {
+	if disabled {
+		return 3
+	}
+	return 1
+}
+
 // buildAuthFileEntry 构建认证文件的API响应条目
 func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 	if auth == nil {
@@ -488,6 +509,7 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		"status":         auth.Status,
 		"status_message": auth.StatusMessage,
 		"disabled":       auth.Disabled,
+		"db_status":      managementDBStatus(auth),
 		"unavailable":    auth.Unavailable,
 		"runtime_only":   false,
 		"source":         "memory",
@@ -1231,14 +1253,14 @@ func (h *Handler) DeleteAuthData(c *gin.Context) {
 	if isTruthyFlag(allRaw) {
 		reg := registry.GetGlobalRegistry()
 		if h != nil && h.authManager != nil {
-			for _, auth := range h.authManager.List() {
+			for _, auth := range h.authManager.ListAll() {
 				if isRuntimeOnlyAuth(auth) {
 					continue
 				}
 				if auth != nil && strings.TrimSpace(auth.ID) != "" {
 					reg.UnregisterClient(auth.ID)
 				}
-				h.disableAuth(ctx, auth.ID)
+				h.removeAuth(ctx, auth.ID)
 			}
 		}
 
@@ -1276,7 +1298,7 @@ func (h *Handler) DeleteAuthData(c *gin.Context) {
 			authID = strings.TrimSpace(target.ID)
 		}
 		registry.GetGlobalRegistry().UnregisterClient(authID)
-		h.disableAuth(ctx, authID)
+		h.removeAuth(ctx, authID)
 
 		if err := deleteOauthRecords(ctx, authID); err != nil {
 			failed = append(failed, gin.H{"name": name, "error": err.Error()})
@@ -1576,7 +1598,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	if auth, ok := h.authManager.GetByID(name); ok {
 		targetAuth = auth
 	} else {
-		auths := h.authManager.List()
+		auths := h.authManager.ListAll()
 		for _, auth := range auths {
 			if auth.FileName == name {
 				targetAuth = auth
@@ -1619,6 +1641,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"status":           "ok",
 			"disabled":         *req.Disabled,
+			"db_status":        managementDBStatusFromDisabled(*req.Disabled),
 			"via":              "config:excluded-models",
 			"excluded_pattern": configAPIKeyDisablePattern,
 		})
@@ -1651,7 +1674,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	finder := zorm.NewUpdateFinder((&entity.CLIOauth{}).GetTableName())
 	status := coreauth.DBStatusForAuth(targetAuth)
 
-	finder.Append("status=?, updated_at=?, error_reason=? where id=?", status, time.Now(), "", name)
+	finder.Append("status=?, updated_at=?, error_reason=? where id=?", status, time.Now(), "", targetAuth.ID)
 
 	// 以事务方式持久化状态更新。
 	_, err := zorm.Transaction(ctx, func(txCtx context.Context) (interface{}, error) {
@@ -1666,7 +1689,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled, "db_status": managementDBStatusFromDisabled(*req.Disabled)})
 }
 
 // PatchAuthFileFields updates arbitrary metadata fields of an auth file.
@@ -1708,7 +1731,7 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	if auth, ok := h.authManager.GetByID(name); ok {
 		targetAuth = auth
 	} else {
-		auths := h.authManager.List()
+		auths := h.authManager.ListAll()
 		for _, auth := range auths {
 			if auth.FileName == name {
 				targetAuth = auth

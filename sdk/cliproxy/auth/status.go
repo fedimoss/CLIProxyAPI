@@ -86,12 +86,13 @@ func IsAuthActiveForRouting(auth *Auth) bool {
 	return !auth.Disabled && auth.Status != StatusDisabled
 }
 
-// ApplyManualDisabled 为管理操作应用一致的禁用状态。
+// ApplyManualDisabled 为管理操作的停用动作设置 status=3（DBStatusQuotaLimited），
+// 与额度不足共用同一状态桶：健康探测会按额度机制定期复检，账号可用时自动恢复为启用（status=1）。
 func ApplyManualDisabled(auth *Auth, reason string, now time.Time) {
 	if auth == nil {
 		return
 	}
-	auth.DBStatus = DBStatusDisabled
+	auth.DBStatus = DBStatusQuotaLimited
 	auth.Disabled = true
 	auth.Unavailable = false
 	auth.Status = StatusDisabled

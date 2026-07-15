@@ -973,28 +973,23 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
 	}
-	filePath := managementasset.FilePath(s.configFilePath)
-	if strings.TrimSpace(filePath) == "" {
-		c.AbortWithStatus(http.StatusNotFound)
+
+	// Honor an explicit on-disk override (MANAGEMENT_STATIC_PATH) so operators
+	// can swap the panel without rebuilding the binary.
+	if data, ok := managementasset.LocalOverrideManagementHTML(); ok {
+		c.Data(http.StatusOK, "text/html; charset=utf-8", data)
 		return
 	}
 
-	if _, err := os.Stat(filePath); err != nil {
-		if os.IsNotExist(err) {
-			// Synchronously ensure management.html is available with a detached context.
-			// Control panel bootstrap should not be canceled by client disconnects.
-			if !managementasset.EnsureLatestManagementHTML(context.Background(), managementasset.StaticDir(s.configFilePath), cfg.ProxyURL, cfg.RemoteManagement.PanelGitHubRepository) {
-				c.AbortWithStatus(http.StatusNotFound)
-				return
-			}
-		} else {
-			log.WithError(err).Error("failed to stat management control panel asset")
-			c.AbortWithStatus(http.StatusInternalServerError)
-			return
-		}
+	// Serve the panel embedded in the binary. The panel is no longer pulled
+	// from a remote GitHub release; update internal/managementasset/management.html
+	// and rebuild to change it.
+	data := managementasset.EmbeddedManagementHTML()
+	if len(data) == 0 {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
 	}
-
-	c.File(filePath)
+	c.Data(http.StatusOK, "text/html; charset=utf-8", data)
 }
 
 func (s *Server) enableKeepAlive(timeout time.Duration, onTimeout func()) {

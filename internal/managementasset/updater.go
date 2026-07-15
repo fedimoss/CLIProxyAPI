@@ -3,6 +3,7 @@ package managementasset
 import (
 	"context"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -38,11 +39,49 @@ const (
 // ManagementFileName exposes the control panel asset filename.
 const ManagementFileName = managementAssetName
 
+// embeddedManagementHTML is the management control panel HTML bundled into the
+// binary at build time. The panel is no longer fetched from a remote GitHub
+// release; replace this file and rebuild to change the served panel.
+//
+//go:embed management.html
+var embeddedManagementHTML []byte
+
+// EmbeddedManagementHTML returns a copy of the management control panel HTML
+// embedded in the binary. It returns nil when no panel is embedded.
+func EmbeddedManagementHTML() []byte {
+	if len(embeddedManagementHTML) == 0 {
+		return nil
+	}
+	out := make([]byte, len(embeddedManagementHTML))
+	copy(out, embeddedManagementHTML)
+	return out
+}
+
+// LocalOverrideManagementHTML returns the on-disk management.html referenced by
+// the MANAGEMENT_STATIC_PATH override when that file exists. It lets operators
+// swap the panel without rebuilding the binary. When the override is unset or
+// the file is missing it returns ok=false so callers fall back to the embedded
+// panel.
+func LocalOverrideManagementHTML() ([]byte, bool) {
+	override := strings.TrimSpace(os.Getenv("MANAGEMENT_STATIC_PATH"))
+	if override == "" {
+		return nil, false
+	}
+	path := filepath.Clean(override)
+	if !strings.EqualFold(filepath.Base(path), managementAssetName) {
+		path = filepath.Join(path, ManagementFileName)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false
+	}
+	return data, true
+}
+
 var (
 	lastUpdateCheckMu   sync.Mutex
 	lastUpdateCheckTime time.Time
 	currentConfigPtr    atomic.Pointer[config.Config]
-	schedulerOnce       sync.Once
 	schedulerConfigPath atomic.Value
 	sfGroup             singleflight.Group
 )
@@ -56,20 +95,19 @@ func SetCurrentConfig(cfg *config.Config) {
 	currentConfigPtr.Store(cfg)
 }
 
-// StartAutoUpdater launches a background goroutine that periodically ensures the management asset is up to date.
-// It respects the disable-control-panel flag on every iteration and supports hot-reloaded configurations.
-func StartAutoUpdater(ctx context.Context, configFilePath string) {
+// StartAutoUpdater is retained for backward compatibility but is now a no-op.
+//
+// The management control panel is bundled into the binary via go:embed (see
+// EmbeddedManagementHTML) and is no longer fetched from a remote GitHub release.
+// This entry point intentionally does not launch the background fetcher, so
+// callers cannot re-enable remote pulling. To change the served panel, replace
+// internal/managementasset/management.html and rebuild.
+func StartAutoUpdater(_ context.Context, configFilePath string) {
 	configFilePath = strings.TrimSpace(configFilePath)
-	if configFilePath == "" {
-		log.Debug("management asset auto-updater skipped: empty config path")
-		return
+	if configFilePath != "" {
+		schedulerConfigPath.Store(configFilePath)
 	}
-
-	schedulerConfigPath.Store(configFilePath)
-
-	schedulerOnce.Do(func() {
-		go runAutoUpdater(ctx)
-	})
+	log.Debug("management asset auto-updater is disabled: panel is bundled in the binary")
 }
 
 func runAutoUpdater(ctx context.Context) {
