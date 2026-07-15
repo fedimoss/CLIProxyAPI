@@ -57,3 +57,4 @@ _bmad-output/*
 ._*
 .gocache/
 .gitnexus/
+internal/managementasset/management.html
