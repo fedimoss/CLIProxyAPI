@@ -3,9 +3,11 @@ package cliproxy
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
+	sdkpluginstore "github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
 )
 
 func TestSyncHomePluginsSkipsUnchangedSignature(t *testing.T) {
@@ -14,13 +16,19 @@ func TestSyncHomePluginsSkipsUnchangedSignature(t *testing.T) {
 	cfg.Plugins.Enabled = true
 	cfg.Plugins.Configs = map[string]config.PluginInstanceConfig{}
 
-	service := &Service{}
-	_, key, didSync, errSync := service.syncHomePlugins(context.Background(), cfg)
+	service := &Service{homePluginSyncFetch: func(context.Context, sdkpluginstore.PluginSyncRequest) (sdkpluginstore.PluginSyncResponse, error) {
+		return sdkpluginstore.PluginSyncResponse{
+			SchemaVersion: sdkpluginstore.PluginSyncSchemaVersion,
+			ExpiresAt:     time.Now().UTC().Add(time.Minute),
+			Items:         []sdkpluginstore.PluginSyncItem{},
+		}, nil
+	}}
+	report, key, didSync, errSync := service.syncHomePlugins(context.Background(), cfg)
 	if errSync != nil {
 		t.Fatalf("syncHomePlugins() error = %v", errSync)
 	}
-	if !didSync || key == "" {
-		t.Fatalf("syncHomePlugins() didSync=%v key=%q, want first sync with key", didSync, key)
+	if !didSync || key == "" || !report.OK {
+		t.Fatalf("syncHomePlugins() didSync=%v key=%q report=%+v, want reportable empty plan", didSync, key, report)
 	}
 	service.markHomePluginsSynced(key)
 
@@ -83,5 +91,29 @@ func TestStartHomeSubscriberDoesNotPreMarkPluginSync(t *testing.T) {
 
 	if service.homePluginSyncKey != "" {
 		t.Fatalf("homePluginSyncKey = %q, want empty before a successful plugin sync", service.homePluginSyncKey)
+	}
+}
+
+func TestHomePluginSyncKeyIncludesCredentialRevision(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Home.Enabled = true
+	cfg.Plugins.Enabled = true
+	cfg.Plugins.Configs = map[string]config.PluginInstanceConfig{}
+	first := homePluginSyncKey(cfg)
+	cfg.Plugins.AuthRevision = 2
+	second := homePluginSyncKey(cfg)
+	if first == second {
+		t.Fatalf("homePluginSyncKey() unchanged after sync revision update: %q", first)
+	}
+}
+
+func TestForceHomeRuntimeConfigClearsStoreAuth(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Plugins.StoreAuth = []sdkpluginstore.AuthConfig{{
+		Match: "https://downloads.example/", Type: sdkpluginstore.AuthTypeBearer, TokenEnv: "PLUGIN_TOKEN",
+	}}
+	forceHomeRuntimeConfig(cfg)
+	if cfg.Plugins.StoreAuth != nil {
+		t.Fatalf("Plugins.StoreAuth = %#v, want nil in Home mode", cfg.Plugins.StoreAuth)
 	}
 }
