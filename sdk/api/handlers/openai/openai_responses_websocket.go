@@ -647,6 +647,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			continue
 		}
 
+		toolCacheTurn := newResponsesWebsocketToolCacheTurn(downstreamSessionKey)
 		previousLastRequest := bytes.Clone(lastRequest)
 		previousLastResponseOutput := bytes.Clone(lastResponseOutput)
 		previousLastResponseID := lastResponseID
@@ -656,7 +657,8 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				passthroughModelName = modelName
 			}
 		} else {
-			requestJSON = repairResponsesWebsocketToolCalls(downstreamSessionKey, requestJSON)
+			toolCacheTurn.recordRequest(requestJSON)
+			requestJSON = repairResponsesWebsocketToolCallsWithoutRecording(downstreamSessionKey, requestJSON)
 			requestJSON = dedupeResponsesWebsocketInputItemsByID(requestJSON)
 			updatedLastRequest = bytes.Clone(requestJSON)
 			lastRequest = updatedLastRequest
@@ -712,6 +714,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			wsTimelineLog,
 			passthroughSessionID,
 			responsesWebsocketForwardOptions{
+				toolCacheTurn: toolCacheTurn,
 				suppressError: replayPinnedAuthFailure,
 			},
 		)
@@ -744,6 +747,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			continue
 		}
 
+		toolCacheTurn.commit()
 		upstreamMode = attemptedUpstreamMode
 		if upstreamMode == responsesWebsocketUpstreamModeWS {
 			upstreamWebsocketAuthID = lastAttemptedAuthID
@@ -1690,6 +1694,7 @@ func normalizeJSONArrayRaw(raw []byte) string {
 }
 
 type responsesWebsocketForwardOptions struct {
+	toolCacheTurn *responsesWebsocketToolCacheTurn
 	suppressError func(*interfaces.ErrorMessage) bool
 }
 
@@ -1707,6 +1712,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 	if len(options) > 0 {
 		opts = options[0]
 	}
+	toolCacheTurn := opts.toolCacheTurn
 	completed := false
 	completedOutput := []byte("[]")
 	completedResponseID := ""
@@ -1808,7 +1814,11 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				if isResponsesWebsocketCompletionEvent(eventType) {
 					payloads[i] = restoreResponsesWebsocketCompletionOutput(payloads[i], outputItemsByIndex, outputItemsFallback)
 				}
-				recordResponsesWebsocketToolCallsFromPayload(downstreamSessionKey, payloads[i])
+				if toolCacheTurn != nil {
+					toolCacheTurn.recordResponse(payloads[i])
+				} else {
+					recordResponsesWebsocketToolCallsFromPayload(downstreamSessionKey, payloads[i])
+				}
 				recordPendingToolCallIDsFromPayload(pendingToolCallIDs, payloads[i])
 				var payloadErrMsg *interfaces.ErrorMessage
 				if eventType == wsEventTypeError {
