@@ -28,6 +28,7 @@ import (
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v7/internal/api/handlers/management"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api/middleware"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
+	codexmodels "github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/models"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
@@ -1266,7 +1267,7 @@ func (s *Server) handleHomeCodexClientModels(c *gin.Context) {
 		models = append(models, model)
 	}
 
-	c.JSON(http.StatusOK, openai.CodexClientModelsResponseWithMultiAgentV2(models, s.cfg.Codex.OptimizeMultiAgentV2))
+	c.JSON(http.StatusOK, codexmodels.BuildResponse(models, nil, s.cfg.Codex.OptimizeMultiAgentV2))
 }
 
 func (s *Server) geminiModelsHandler(geminiHandler *gemini.GeminiAPIHandler) gin.HandlerFunc {
