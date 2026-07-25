@@ -243,6 +243,9 @@ func (e *XAIExecutor) executeCompactRequest(ctx context.Context, auth *cliproxya
 	}
 	prepared.body, _ = sjson.DeleteBytes(prepared.body, "stream")
 	prepared.body, _ = sjson.DeleteBytes(prepared.body, "tools")
+	for _, field := range []string{"max_output_tokens", "temperature", "top_p", "top_k", "stop"} {
+		prepared.body, _ = sjson.DeleteBytes(prepared.body, field)
+	}
 	prepared.body = xaiRemoveInputItemsByType(prepared.body, "compaction_trigger")
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, prepared.baseModel, auth)
@@ -1010,7 +1013,9 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	}
 	originalPayload := bytes.Clone(originalPayloadSource)
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, stream)
+	originalTranslated = preserveXAIResponsesOutputControls(originalTranslated, originalPayload, from)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), stream)
+	body = preserveXAIResponsesOutputControls(body, req.Payload, from)
 
 	var err error
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), e.Identifier(), e.Identifier())
@@ -1435,7 +1440,35 @@ func xaiMetadataString(meta map[string]any, key string) string {
 	}
 }
 
+func preserveXAIResponsesOutputControls(body, source []byte, from sdktranslator.Format) []byte {
+	var maxOutputTokens gjson.Result
+	switch from {
+	case sdktranslator.FormatOpenAI:
+		maxOutputTokens = gjson.GetBytes(source, "max_completion_tokens")
+		if !maxOutputTokens.Exists() || maxOutputTokens.Type == gjson.Null {
+			maxOutputTokens = gjson.GetBytes(source, "max_tokens")
+		}
+	case sdktranslator.FormatOpenAIResponse:
+		maxOutputTokens = gjson.GetBytes(source, "max_output_tokens")
+	default:
+		return body
+	}
+
+	if maxOutputTokens.Exists() && maxOutputTokens.Type != gjson.Null {
+		body, _ = sjson.SetRawBytes(body, "max_output_tokens", []byte(maxOutputTokens.Raw))
+	}
+	for _, field := range []string{"temperature", "top_p", "top_k"} {
+		value := gjson.GetBytes(source, field)
+		if value.Exists() && value.Type != gjson.Null {
+			body, _ = sjson.SetRawBytes(body, field, []byte(value.Raw))
+		}
+	}
+	return body
+}
+
 func sanitizeXAIResponsesBody(body []byte, model string) []byte {
+	// stop is supported by Chat Completions but not by xAI's Responses API.
+	body, _ = sjson.DeleteBytes(body, "stop")
 	if !xaiSupportsReasoningEffort(model) {
 		if gjson.GetBytes(body, "reasoning.effort").Exists() {
 			log.Debugf("xai: stripping reasoning.effort for model %s (no thinking levels in model registry)", model)
