@@ -194,6 +194,12 @@ codex:
   # into standard user messages for non-Codex upstream protocols.
   optimize-multi-agent-v2: false
 
+# xAI provider behavior.
+xai:
+  # When true, inject the native x_search tool when the request does not declare it.
+  # The injected tool is also added to tool_choice.allowed_tools when applicable.
+  inject-x-search: false
+
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: true
 
