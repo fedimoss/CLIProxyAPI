@@ -649,7 +649,7 @@ func (m *Manager) refreshAuthForHealthProbe(ctx context.Context, id string) (*Au
 	updated, err := exec.Refresh(ctx, cloned)
 	if err != nil {
 		log.Debugf("health probe refresh failed for %s %s: %v", auth.Provider, auth.ID, err)
-		return auth.Clone(), true
+		return auth.Clone(), false
 	}
 
 	if updated == nil {
