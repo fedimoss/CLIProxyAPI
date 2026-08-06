@@ -284,6 +284,9 @@ func (b *Builder) Build() (*Service, error) {
 	}
 	service.serverOptions = append(service.serverOptions,
 		api.WithPostAuthPersistHook(service.runtimeAuthSyncHook()),
+		api.WithPostRegisterHook(func(ctx context.Context, a *coreauth.Auth) {
+			_ = service.runtimeAuthSyncHook()(ctx, a)
+		}),
 		api.WithPluginHost(pluginHost),
 		api.WithConfigReloadHook(func(_ context.Context, _ *config.Config) {
 			service.reloadConfigFromWatcher()
