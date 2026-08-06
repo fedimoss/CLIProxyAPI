@@ -10,7 +10,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
-	log "github.com/sirupsen/logrus"
 )
 
 type openAICompatibilityRegistrationCache struct {
@@ -350,7 +349,6 @@ func (s *Service) registerResolvedModelsForAuth(a *coreauth.Auth, providerKey st
 		return
 	}
 	GlobalModelRegistry().RegisterClient(a.ID, providerKey, normalizedModels)
-	log.Infof("model registration: clientID=%s provider=%s models=%d", a.ID, providerKey, len(normalizedModels))
 }
 
 func (s *Service) pluginModelsForProvider(providerKey string) []*ModelInfo {
