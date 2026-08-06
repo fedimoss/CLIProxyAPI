@@ -210,9 +210,14 @@ func (s *Service) Run(ctx context.Context) error {
 	// Prefer core auth manager auto refresh if available.
 	if s.coreManager != nil && !homeEnabled {
 		interval := s.oauthHealthProbeInterval(s.cfg)
-		s.coreManager.StartAutoRefreshLocal(context.Background(), interval)
-		s.appliedHealthProbeInterval = interval
-		log.Infof("core auth auto-refresh started (interval=%s)", interval)
+		// applyConfigUpdate may already have started the auto-refresh loop (it
+		// sets appliedHealthProbeInterval). Starting it again would cancel the
+		// first loop's context and abort the in-flight startup health probe.
+		if s.appliedHealthProbeInterval == 0 {
+			s.coreManager.StartAutoRefreshLocal(context.Background(), interval)
+			s.appliedHealthProbeInterval = interval
+			log.Infof("core auth auto-refresh started (interval=%s)", interval)
+		}
 	}
 
 	select {
