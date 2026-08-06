@@ -98,6 +98,7 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		}
 		if entry := h.buildAuthFileEntry(auth); entry != nil {
 			files = append(files, entry)
+		} else {
 		}
 	}
 	sort.Slice(files, func(i, j int) bool {
