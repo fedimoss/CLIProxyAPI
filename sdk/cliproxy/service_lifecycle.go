@@ -79,6 +79,14 @@ func (s *Service) Run(ctx context.Context) error {
 			log.Warnf("failed to load auth store: %v", errLoad)
 		}
 		s.registerConfigAPIKeyAuths(coreauth.WithSkipPersist(ctx), s.cfg)
+		// DB-loaded auths do not pass through the watcher, so register executors and models here.
+		for _, auth := range s.coreManager.ListAll() {
+			if auth == nil || auth.ID == "" || auth.Disabled {
+				continue
+			}
+			s.ensureExecutorsForAuth(auth)
+			s.completeModelRegistrationForAuth(ctx, auth)
+		}
 		if s.cfg.SaveCooldownStatus {
 			if errRestoreCooldown := s.coreManager.RestoreCooldownStates(ctx); errRestoreCooldown != nil {
 				log.Warnf("failed to restore cooldown state: %v", errRestoreCooldown)
