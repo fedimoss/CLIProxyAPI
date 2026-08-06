@@ -141,6 +141,13 @@ func (m *Manager) runAuthHealthProbeLocal(parent context.Context, auth *Auth) {
 
 	statusCode, body, errProbe := m.executeAuthHealthProbeLocal(ctx, auth)
 	if errProbe != nil {
+		// A cancelled probe context (e.g. config reload restarting the auto-refresh
+		// loop) is not a health failure; skip state updates and let the next
+		// periodic probe re-evaluate.
+		if ctx != nil && errors.Is(ctx.Err(), context.Canceled) {
+			log.WithError(errProbe).Debugf("auth health probe cancelled for %s (%s)", auth.Provider, auth.ID)
+			return
+		}
 		log.WithError(errProbe).Debugf("auth health probe failed for %s (%s)", auth.Provider, auth.ID)
 		decision := authHealthProbeDecisionLocal{
 			DBStatus:   DBStatusDisabled,
