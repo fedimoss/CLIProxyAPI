@@ -35,6 +35,21 @@ func (s *Server) applyAccessConfig(oldCfg, newCfg *config.Config) bool {
 //   - clients: The new slice of AI service clients
 //   - cfg: The new application configuration
 func (s *Server) UpdateClients(cfg *config.Config) {
+	s.UpdateClientsContext(context.Background(), cfg)
+}
+
+// UpdateClientsContext updates runtime clients while honoring cancellation between
+// short configuration and filesystem operations.
+func (s *Server) UpdateClientsContext(ctx context.Context, cfg *config.Config) bool {
+	if s == nil || cfg == nil {
+		return false
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if errContext := ctx.Err(); errContext != nil {
+		return false
+	}
 	// Reconstruct old config from YAML snapshot to avoid reference sharing issues
 	var oldCfg *config.Config
 	if len(s.oldConfigYaml) > 0 {
@@ -63,6 +78,9 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	if oldCfg == nil || oldCfg.LoggingToFile != cfg.LoggingToFile || oldCfg.LogsMaxTotalSizeMB != cfg.LogsMaxTotalSizeMB {
 		if err := logging.ConfigureLogOutput(cfg); err != nil {
 			log.Errorf("failed to reconfigure log output: %v", err)
+		}
+		if errContext := ctx.Err(); errContext != nil {
+			return false
 		}
 	}
 
@@ -144,11 +162,19 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		s.exampleAPIKeySafeModeActive.Store(exampleAPIKeySafeModeRequired)
 	}
 	s.cfg = cfg
+	if s.codexLiveHandler != nil {
+		if errUpdate := s.codexLiveHandler.UpdateConfig(cfg); errUpdate != nil {
+			log.WithError(errUpdate).Error("failed to update Codex Live media relay configuration")
+		}
+	}
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	if oldCfg != nil && s.wsAuthChanged != nil && oldCfg.WebsocketAuth != cfg.WebsocketAuth {
 		s.wsAuthChanged(oldCfg.WebsocketAuth, cfg.WebsocketAuth)
 	}
 	managementasset.SetCurrentConfig(cfg)
+	if errContext := ctx.Err(); errContext != nil {
+		return false
+	}
 	// Save YAML snapshot for next comparison
 	s.oldConfigYaml, _ = yaml.Marshal(cfg)
 
@@ -173,7 +199,10 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok {
 			dirSetter.SetBaseDir(cfg.AuthDir)
 		}
-		authEntries = util.CountAuthFiles(context.Background(), tokenStore)
+		authEntries = util.CountAuthFiles(ctx, tokenStore)
+		if errContext := ctx.Err(); errContext != nil {
+			return false
+		}
 	}
 	geminiAPIKeyCount := len(cfg.GeminiKey)
 	interactionsAPIKeyCount := len(cfg.InteractionsKey)
@@ -202,6 +231,7 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		vertexAICompatCount,
 		openAICompatCount,
 	)
+	return ctx.Err() == nil
 }
 
 func (s *Server) SetWebsocketAuthChangeHandler(fn func(bool, bool)) {
@@ -210,8 +240,6 @@ func (s *Server) SetWebsocketAuthChangeHandler(fn func(bool, bool)) {
 	}
 	s.wsAuthChanged = fn
 }
-
-// (management handlers moved to internal/api/handlers/management)
 
 func configuredSignatureCacheEnabled(cfg *config.Config) bool {
 	if cfg != nil && cfg.AntigravitySignatureCacheEnabled != nil {

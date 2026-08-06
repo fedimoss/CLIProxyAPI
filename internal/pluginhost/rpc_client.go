@@ -131,6 +131,9 @@ func registerRPCPlugin(ctx context.Context, host *Host, id string, client plugin
 	if resp.Capabilities.CommandLinePlugin {
 		plugin.Capabilities.CommandLinePlugin = adapter
 	}
+	if resp.Capabilities.RequestLifecyclePlugin {
+		plugin.Capabilities.RequestLifecyclePlugin = adapter
+	}
 	if resp.Capabilities.ManagementAPI {
 		plugin.Capabilities.ManagementAPI = adapter
 	}
@@ -478,6 +481,16 @@ func (a *rpcPluginAdapter) InterceptRequestAfterAuth(ctx context.Context, req pl
 
 func (a *rpcPluginAdapter) TranslateResponse(ctx context.Context, req pluginapi.ResponseTransformRequest) (pluginapi.PayloadResponse, error) {
 	return callPlugin[pluginapi.PayloadResponse](ctx, a.client, pluginabi.MethodResponseTranslate, req)
+}
+
+func (a *rpcPluginAdapter) HandleRequestComplete(ctx context.Context, completion pluginapi.RequestCompletion) error {
+	callbackID, closeCallback := a.openHostCallbackContext(ctx)
+	defer closeCallback()
+	_, errCall := callPlugin[rpcEmptyResponse](ctx, a.client, pluginabi.MethodRequestComplete, rpcRequestCompletion{
+		RequestCompletion: completion,
+		HostCallbackID:    callbackID,
+	})
+	return errCall
 }
 
 func (a rpcResponseNormalizer) NormalizeResponse(ctx context.Context, req pluginapi.ResponseTransformRequest) (pluginapi.PayloadResponse, error) {

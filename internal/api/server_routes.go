@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,12 +14,14 @@ import (
 
 	"github.com/gin-gonic/gin"
 	managementHandlers "github.com/router-for-me/CLIProxyAPI/v7/internal/api/handlers/management"
+	claudemodels "github.com/router-for-me/CLIProxyAPI/v7/internal/client/claude/models"
+	codexlive "github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/live"
 	codexmodels "github.com/router-for-me/CLIProxyAPI/v7/internal/client/codex/models"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/client/grokbuild"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/claude"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/gemini"
@@ -52,11 +55,11 @@ func (s *Server) setupRoutes() {
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
 	claudeCodeHandlers := claude.NewClaudeCodeAPIHandler(s.handlers)
 	openaiResponsesHandlers := openai.NewOpenAIResponsesAPIHandler(s.handlers)
+	s.codexLiveHandler = codexlive.NewHandler(s.handlers.AuthManager, s.cfg)
 
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
 	v1.Use(AuthMiddleware(s.accessManager))
-	v1.Use(UserOAuthPinMiddleware())
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
@@ -74,6 +77,11 @@ func (s *Server) setupRoutes() {
 		v1.POST("/responses", openaiResponsesHandlers.Responses)
 		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
 		v1.POST("/alpha/search", s.codexAlphaSearch)
+		v1.POST("/live", s.codexLiveHandler.Handle)
+		v1.GET("/live/:call_id", s.codexLiveHandler.HandleSideband)
+		v1.POST("/realtime/calls", s.codexLiveHandler.Handle)
+		v1.GET("/realtime/calls/:call_id", s.codexLiveHandler.HandleSideband)
+		v1.GET("/realtime", s.codexLiveHandler.HandleSideband)
 	}
 
 	openaiV1 := s.engine.Group("/openai/v1")
@@ -97,7 +105,6 @@ func (s *Server) setupRoutes() {
 	// Gemini compatible API routes
 	v1beta := s.engine.Group("/v1beta")
 	v1beta.Use(AuthMiddleware(s.accessManager))
-	v1beta.Use(UserOAuthPinMiddleware())
 	{
 		v1beta.GET("/models", s.geminiModelsHandler(geminiHandlers))
 		v1beta.POST("/interactions", geminiHandlers.Interactions)
@@ -244,6 +251,13 @@ func sanitizeCodexAlphaSearchBody(body []byte) []byte {
 	return sanitizedBody
 }
 
+func homeSelectionAttemptContext(ctx context.Context, selection *auth.HomeDispatchSelection) (context.Context, func(), error) {
+	if selection == nil {
+		return nil, func() {}, errors.New("Home dispatch selection is nil")
+	}
+	return selection.AttemptContext(ctx)
+}
+
 // codexAlphaSearch forwards the standalone search endpoint used by current
 // Codex clients. Unlike /responses, this payload is already in Codex search
 // format and must not pass through a protocol translator.
@@ -277,72 +291,175 @@ func (s *Server) codexAlphaSearch(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errRoute.Error()})
 		return
 	}
-	selected, err := s.handlers.AuthManager.SelectAuthByKind(ctx, "codex", selectionModel, auth.AuthKindOAuth, coreexecutor.Options{
-		Headers:         selectionHeaders,
-		OriginalRequest: body,
-	})
+	selectionOpts := coreexecutor.Options{Headers: selectionHeaders, OriginalRequest: body}
+	var selection *auth.HomeDispatchSelection
+	var selected *auth.Auth
+	if s.handlers.AuthManager.HomeEnabled() {
+		selection, err = s.handlers.AuthManager.SelectHomeAuthWithCredentialPolicy(ctx, "codex", selectionModel, auth.CredentialPolicyCodexAlphaSearchV1, selectionOpts)
+		if selection != nil {
+			selected = selection.CloneAuth()
+		}
+	} else {
+		selected, err = s.handlers.AuthManager.SelectAuthWithCredentialPolicy(ctx, "codex", selectionModel, auth.CredentialPolicyCodexAlphaSearchV1, selectionOpts)
+	}
 	if err != nil {
 		status := http.StatusServiceUnavailable
 		if statusError, ok := err.(interface{ StatusCode() int }); ok && statusError.StatusCode() > 0 {
 			status = statusError.StatusCode()
 		}
+		for _, value := range auth.SafeResponseHeaders(err).Values("Retry-After") {
+			c.Writer.Header().Add("Retry-After", value)
+		}
 		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
-	logging.SetGinCPATraceID(c, selected.EnsureIndex())
-
-	headers := make(http.Header)
-	headers.Set("Content-Type", "application/json")
-	headers.Set("Accept", "application/json")
-	headers.Set("Originator", "codex_cli_rs")
-	for _, name := range []string{"Version", "User-Agent", "Session_id", "X-Client-Request-Id"} {
-		if value := strings.TrimSpace(c.GetHeader(name)); value != "" {
-			headers.Set(name, value)
+	if selected == nil {
+		if selection != nil {
+			selection.End("missing_auth")
 		}
-	}
-	if accountID, ok := selected.Metadata["account_id"].(string); ok && strings.TrimSpace(accountID) != "" {
-		headers.Set("Chatgpt-Account-Id", accountID)
-	}
-
-	const upstreamURL = "https://chatgpt.com/backend-api/codex/alpha/search"
-	req, err := s.handlers.AuthManager.NewHttpRequest(
-		ctx, selected, http.MethodPost, upstreamURL, upstreamRequestBody, headers,
-	)
-	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Codex auth unavailable"})
 		return
 	}
-
-	var authID, authLabel, authType, authValue string
-	if selected != nil {
-		authID = selected.ID
-		authLabel = selected.Label
-		authType, authValue = selected.AccountInfo()
+	var releaseAttempt func()
+	if selection != nil {
+		attemptCtx, release, errBind := homeSelectionAttemptContext(ctx, selection)
+		if errBind != nil {
+			selection.End("attempt_bind_failed")
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": errBind.Error()})
+			return
+		}
+		ctx = attemptCtx
+		releaseAttempt = release
+		defer releaseAttempt()
 	}
-	helpHeaders := req.Header.Clone()
-	helps.RecordAPIRequest(ctx, s.cfg, helps.UpstreamRequestLog{
-		URL:       upstreamURL,
-		Method:    http.MethodPost,
-		Headers:   helpHeaders,
-		Body:      upstreamRequestBody,
-		Provider:  "codex",
-		AuthID:    authID,
-		AuthLabel: authLabel,
-		AuthType:  authType,
-		AuthValue: authValue,
-	})
+	logging.SetGinCPATraceID(c, selected.EnsureIndex())
 
-	resp, err := s.handlers.AuthManager.HttpRequest(ctx, selected, req)
+	baseHeaders := make(http.Header)
+	baseHeaders.Set("Content-Type", "application/json")
+	baseHeaders.Set("Accept", "application/json")
+	baseHeaders.Set("Originator", "codex_cli_rs")
+	for _, name := range []string{"Version", "User-Agent", "Session_id", "X-Client-Request-Id"} {
+		if value := strings.TrimSpace(c.GetHeader(name)); value != "" {
+			baseHeaders.Set(name, value)
+		}
+	}
+
+	errMissingBaseURL := errors.New("Codex Alpha Search API key base URL unavailable")
+	performRequest := func(current *auth.Auth) (*http.Response, error) {
+		headers := baseHeaders.Clone()
+		if accountID, ok := current.Metadata["account_id"].(string); ok && strings.TrimSpace(accountID) != "" {
+			headers.Set("Chatgpt-Account-Id", accountID)
+		}
+		upstreamURL := "https://chatgpt.com/backend-api/codex/alpha/search"
+		if current.AuthKind() == auth.AuthKindAPIKey {
+			baseURL := ""
+			if current.Attributes != nil {
+				baseURL = strings.TrimSpace(current.Attributes["base_url"])
+			}
+			if baseURL == "" {
+				return nil, errMissingBaseURL
+			}
+			upstreamURL = strings.TrimRight(baseURL, "/") + "/alpha/search"
+		}
+		req, errRequest := s.handlers.AuthManager.NewHttpRequest(ctx, current, http.MethodPost, upstreamURL, upstreamRequestBody, headers)
+		if errRequest != nil {
+			return nil, errRequest
+		}
+		authType, authValue := current.AccountInfo()
+		helps.RecordAPIRequest(ctx, s.cfg, helps.UpstreamRequestLog{
+			URL:       upstreamURL,
+			Method:    http.MethodPost,
+			Headers:   req.Header.Clone(),
+			Body:      upstreamRequestBody,
+			Provider:  "codex",
+			AuthID:    current.ID,
+			AuthLabel: current.Label,
+			AuthType:  authType,
+			AuthValue: authValue,
+		})
+		return s.handlers.AuthManager.HttpRequest(ctx, current, req)
+	}
+
+	if errCtx := ctx.Err(); errCtx != nil {
+		if selection != nil {
+			selection.End("attempt_canceled")
+		}
+		c.JSON(http.StatusRequestTimeout, gin.H{"error": errCtx.Error()})
+		return
+	}
+	resp, err := performRequest(selected)
 	if err != nil {
+		if errors.Is(err, errMissingBaseURL) {
+			if selection != nil {
+				selection.End("missing_base_url")
+			}
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+			return
+		}
+		if selection != nil {
+			selection.End("request_failed")
+		}
 		helps.RecordAPIResponseError(ctx, s.cfg, err)
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		return
 	}
-	defer func() {
+	if selection != nil && resp.StatusCode == http.StatusUnauthorized {
+		s.handlers.AuthManager.ReportHomeUnauthorized(ctx, selected, "codex", selectionModel)
+		helps.RecordAPIResponseMetadata(ctx, s.cfg, resp.StatusCode, resp.Header.Clone())
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 		if errClose := resp.Body.Close(); errClose != nil {
+			log.Errorf("codex alpha search: close unauthorized response body error: %v", errClose)
+		}
+		refreshed, didRefresh, errRefresh := s.handlers.AuthManager.RefreshHomeSelectionAfterUnauthorized(ctx, selection, selected)
+		if errRefresh != nil {
+			selection.End("refresh_failed")
+			status := http.StatusServiceUnavailable
+			if statusError, ok := errRefresh.(interface{ StatusCode() int }); ok && statusError.StatusCode() > 0 {
+				status = statusError.StatusCode()
+			}
+			c.JSON(status, gin.H{"error": errRefresh.Error()})
+			return
+		}
+		if !didRefresh || refreshed == nil {
+			selection.End("refresh_unavailable")
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Codex credential unauthorized"})
+			return
+		}
+		selected = refreshed
+		logging.SetGinCPATraceID(c, selected.EnsureIndex())
+		resp, err = performRequest(selected)
+		if err != nil {
+			if errors.Is(err, errMissingBaseURL) {
+				selection.End("missing_base_url")
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
+				return
+			}
+			selection.End("retry_failed")
+			helps.RecordAPIResponseError(ctx, s.cfg, err)
+			c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+			return
+		}
+		if resp.StatusCode == http.StatusUnauthorized {
+			s.handlers.AuthManager.ReportHomeUnauthorized(ctx, selected, "codex", selectionModel)
+		}
+	}
+	closeResponseBody := func() error {
+		errClose := resp.Body.Close()
+		if errClose != nil {
 			log.Errorf("codex alpha search: close response body error: %v", errClose)
 		}
-	}()
+		return errClose
+	}
+	if selection != nil {
+		if errBind := selection.Bind(closeResponseBody); errBind != nil {
+			selection.End("response_bind_failed")
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": errBind.Error()})
+			return
+		}
+		defer selection.End("response_closed")
+	} else {
+		defer func() { _ = closeResponseBody() }()
+	}
 	helps.RecordAPIResponseMetadata(ctx, s.cfg, resp.StatusCode, resp.Header.Clone())
 	upstreamBody, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
 	if err != nil {
@@ -380,7 +497,6 @@ func (s *Server) AttachWebsocketRoute(path string, handler http.Handler) {
 	s.wsRouteMu.Unlock()
 
 	authMiddleware := AuthMiddleware(s.accessManager)
-	userOAuthPin := UserOAuthPinMiddleware()
 	conditionalAuth := func(c *gin.Context) {
 		if !s.wsAuthEnabled.Load() {
 			c.Next()
@@ -388,19 +504,12 @@ func (s *Server) AttachWebsocketRoute(path string, handler http.Handler) {
 		}
 		authMiddleware(c)
 	}
-	conditionalPin := func(c *gin.Context) {
-		if !s.wsAuthEnabled.Load() {
-			c.Next()
-			return
-		}
-		userOAuthPin(c)
-	}
 	finalHandler := func(c *gin.Context) {
 		handler.ServeHTTP(c.Writer, c.Request)
 		c.Abort()
 	}
 
-	s.engine.GET(trimmed, conditionalAuth, conditionalPin, finalHandler)
+	s.engine.GET(trimmed, conditionalAuth, finalHandler)
 }
 
 // isAnthropicModelsRequest reports whether a /v1/models request should be served in
@@ -419,6 +528,11 @@ func isAnthropicModelsRequest(c *gin.Context) bool {
 // route to the Claude handler, otherwise they route to the OpenAI handler.
 func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, claudeHandler *claude.ClaudeCodeAPIHandler) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if grokbuild.IsGrokShellUserAgent(c.GetHeader("User-Agent")) {
+			s.handleGrokModels(c)
+			return
+		}
+
 		if _, ok := c.Request.URL.Query()["client_version"]; ok {
 			if s != nil && s.cfg != nil && s.cfg.Home.Enabled {
 				s.handleHomeCodexClientModels(c)
@@ -440,6 +554,51 @@ func (s *Server) unifiedModelsHandler(openaiHandler *openai.OpenAIAPIHandler, cl
 			openaiHandler.OpenAIModels(c)
 		}
 	}
+}
+
+func grokModelsFromHomeEntries(entries []homeModelEntry) []grokbuild.ModelInfo {
+	models := make([]grokbuild.ModelInfo, 0, len(entries))
+	for _, entry := range entries {
+		models = append(models, grokbuild.ModelInfo{
+			ID:            entry.id,
+			DisplayName:   entry.displayName,
+			ContextLength: entry.contextLength,
+		})
+	}
+	return models
+}
+
+func grokModelsFromRegistryInfos(infos []*registry.ModelInfo) []grokbuild.ModelInfo {
+	models := make([]grokbuild.ModelInfo, 0, len(infos))
+	for _, info := range infos {
+		if info == nil {
+			continue
+		}
+		model := grokbuild.ModelInfo{
+			ID:            info.ID,
+			DisplayName:   info.DisplayName,
+			ContextLength: info.ContextLength,
+		}
+		if info.Thinking != nil {
+			model.ReasoningLevels = append([]string(nil), info.Thinking.Levels...)
+		}
+		models = append(models, model)
+	}
+	return models
+}
+
+func (s *Server) handleGrokModels(c *gin.Context) {
+	var models []grokbuild.ModelInfo
+	if s != nil && s.cfg != nil && s.cfg.Home.Enabled {
+		entries, ok := s.loadHomeModelEntries(c)
+		if !ok {
+			return
+		}
+		models = grokModelsFromHomeEntries(entries)
+	} else {
+		models = grokModelsFromRegistryInfos(registry.GetGlobalRegistry().GetAvailableModelInfos())
+	}
+	c.JSON(http.StatusOK, grokbuild.BuildResponse(models))
 }
 
 // handleHomeCodexClientModels builds the Codex client catalog from Home model IDs.
@@ -512,23 +671,8 @@ func (s *Server) handleHomeModels(c *gin.Context) {
 	isClaude := isAnthropicModelsRequest(c)
 
 	if isClaude {
-		out := formatHomeClaudeModels(entries)
-		firstID := ""
-		lastID := ""
-		if len(out) > 0 {
-			if id, okID := out[0]["id"].(string); okID {
-				firstID = id
-			}
-			if id, okID := out[len(out)-1]["id"].(string); okID {
-				lastID = id
-			}
-		}
-		c.JSON(http.StatusOK, gin.H{
-			"data":     out,
-			"has_more": false,
-			"first_id": firstID,
-			"last_id":  lastID,
-		})
+		disableCloaking := s.cfg != nil && s.cfg.ClaudeCode.DisableCloakingModelList
+		c.JSON(http.StatusOK, claudemodels.BuildResponse(formatHomeClaudeModels(entries), disableCloaking))
 		return
 	}
 
@@ -557,16 +701,6 @@ func formatHomeClaudeModels(entries []homeModelEntry) []map[string]any {
 	for _, entry := range entries {
 		out = append(out, formatHomeClaudeModel(entry))
 	}
-	sort.SliceStable(out, func(i, j int) bool {
-		di, _ := out[i]["display_name"].(string)
-		dj, _ := out[j]["display_name"].(string)
-		if di != dj {
-			return di < dj
-		}
-		idi, _ := out[i]["id"].(string)
-		idj, _ := out[j]["id"].(string)
-		return idi < idj
-	})
 	return out
 }
 
@@ -584,7 +718,7 @@ func formatHomeClaudeModel(entry homeModelEntry) map[string]any {
 		maxOutput = registry.DefaultClaudeMaxOutputTokens
 	}
 	model := map[string]any{
-		"id":               util.EnsureClaudeModelIDPrefix(entry.id),
+		"id":               entry.id,
 		"object":           "model",
 		"owned_by":         entry.ownedBy,
 		"type":             "model",

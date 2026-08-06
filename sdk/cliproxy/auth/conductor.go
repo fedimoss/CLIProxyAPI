@@ -131,13 +131,15 @@ func (NoopHook) OnResult(context.Context, Result) {}
 
 // Manager 编排认证生命周期、选择、执行和持久化。
 type Manager struct {
-	store         Store
-	cooldownStore CooldownStateStore
-	executors     map[string]ProviderExecutor
-	selector      Selector
-	hook          Hook
-	mu            sync.RWMutex
-	auths         map[string]*Auth
+	store                     Store
+	cooldownStore             CooldownStateStore
+	pendingCooldownStateStore CooldownStateStore
+	executors                 map[string]ProviderExecutor
+	selector                  Selector
+	hook                      Hook
+	mu                        sync.RWMutex
+	configCooldownMu          sync.Mutex
+	auths                     map[string]*Auth
 
 	// inactiveAuths keeps non-routable auth snapshots so their state remains queryable.
 	inactiveAuths map[string]*Auth
@@ -147,9 +149,17 @@ type Manager struct {
 	// homeRuntimeAuths caches auths returned by Home so websocket sessions can
 	// reuse an established upstream credential without dispatching every turn.
 	homeRuntimeAuths map[string]map[string]*Auth
+	// homeRuntimeAuthOwners prevents a stale selection from clearing a replacement auth.
+	homeRuntimeAuthOwners map[string]map[string]*HomeDispatchSelection
+	// homeSessionSelections owns retained Home selections for websocket sessions.
+	homeSessionSelections map[string]map[homeSessionSelectionKey]*HomeDispatchSelection
+	homeSessionLocks      sync.Map
+	homeSessionAliases    homeSessionAliasCache
 	// providerOffsets tracks per-model provider rotation state for multi-provider routing.
 
-	providerOffsets map[string]int
+	providerOffsets            map[string]int
+	homeDispatchBundle         atomic.Pointer[HomeDispatchBundle]
+	homeInFlightPublisherConfig atomic.Pointer[HomeInFlightPublisherConfig]
 
 	// Retry 控制请求重试行为。
 	requestRetry        atomic.Int32
@@ -162,6 +172,9 @@ type Manager struct {
 	// apiKeyModelAlias 缓存 API 密钥认证已解析的模型别名映射。
 	// 以 auth.ID 为键，值为 alias(小写) -> 上游模型（包含后缀）。
 	apiKeyModelAlias atomic.Value
+
+	// apiKeyModelRouting atomically publishes per-auth aliases and configured capabilities.
+	apiKeyModelRouting atomic.Value
 
 	// modelPoolOffsets 跟踪每个认证的别名池轮转状态。
 	modelPoolOffsets map[string]int

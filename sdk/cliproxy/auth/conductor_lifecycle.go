@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -39,6 +40,11 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	// atomic.Value 要求初始值非 nil。
 	manager.runtimeConfig.Store(&internalconfig.Config{})
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
+	manager.apiKeyModelRouting.Store(&apiKeyModelRoutingSnapshot{config: &internalconfig.Config{}})
+	defaultInFlightConfig, errInFlightConfig := HomeInFlightPublisherConfigFromConfig(internalconfig.DefaultCredentialInFlightConfig())
+	if errInFlightConfig == nil {
+		manager.ApplyHomeInFlightPublisherConfig(defaultInFlightConfig)
+	}
 	manager.scheduler = newAuthScheduler(selector)
 	return manager
 }
@@ -119,29 +125,6 @@ func (m *Manager) SetRoundTripperProvider(p RoundTripperProvider) {
 	m.mu.Unlock()
 }
 
-// SetConfig 更新请求时辅助函数使用的运行时配置快照。
-// 调用者应在重载时提供最新配置，以保持每个凭证的别名映射同步。
-func (m *Manager) SetConfig(cfg *internalconfig.Config) {
-	if m == nil {
-		return
-	}
-	if cfg == nil {
-		cfg = &internalconfig.Config{}
-	}
-	m.runtimeConfig.Store(cfg)
-
-	m.setHealthProbeWorkers(cfg.OAuthHealthProbeMaxWorkers())
-	clearedCooldowns := m.clearDisabledCooldownStates(cfg)
-	if !cfg.Home.Enabled {
-		m.clearHomeRuntimeAuths()
-	}
-
-	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
-	if clearedCooldowns {
-		m.persistCooldownStates(context.Background())
-	}
-}
-
 // SetRetryConfig updates retry attempts, credential retry limit and cooldown wait interval.
 func (m *Manager) SetRetryConfig(retry int, maxRetryInterval time.Duration, maxRetryCredentials int) {
 	if m == nil {
@@ -204,6 +187,9 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth.ID == "" {
 		auth.ID = uuid.NewString()
 	}
+	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
+		return nil, fmt.Errorf("register auth: %w", errWeight)
+	}
 	auth.EnsureIndex()
 	authClone := auth.Clone()
 	m.mu.Lock()
@@ -227,6 +213,9 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil
+	}
+	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
+		return nil, fmt.Errorf("update auth: %w", errWeight)
 	}
 	m.mu.Lock()
 	existing, ok := m.authByIDLocked(auth.ID)
@@ -280,6 +269,9 @@ func (m *Manager) Load(ctx context.Context) error {
 	m.inactiveAuths = make(map[string]*Auth, len(items))
 	for _, auth := range items {
 		if auth == nil || auth.ID == "" {
+			continue
+		}
+		if errWeight := ValidateAuthWeight(auth); errWeight != nil {
 			continue
 		}
 		auth.EnsureIndex()
@@ -443,10 +435,15 @@ func (m *Manager) CloseExecutionSession(sessionID string) {
 	}
 
 	m.mu.Lock()
+	var selections []*HomeDispatchSelection
 	if sessionID == CloseAllExecutionSessionsID {
 		m.clearHomeRuntimeAuthsLocked()
+		selections = m.takeAllHomeSessionSelectionsLocked()
+		m.clearHomeSessionLocks()
 	} else {
 		m.clearHomeRuntimeAuthsForSessionLocked(sessionID)
+		selections = m.takeHomeSessionSelectionsLocked(sessionID)
+		m.homeSessionLocks.Delete(sessionID)
 	}
 	executors := make([]ProviderExecutor, 0, len(m.executors))
 	for _, exec := range m.executors {
@@ -454,6 +451,9 @@ func (m *Manager) CloseExecutionSession(sessionID string) {
 	}
 	m.mu.Unlock()
 
+	for _, selection := range selections {
+		selection.End("session_closed")
+	}
 	for i := range executors {
 		if closer, ok := executors[i].(ExecutionSessionCloser); ok && closer != nil {
 			closer.CloseExecutionSession(sessionID)
@@ -464,6 +464,9 @@ func (m *Manager) CloseExecutionSession(sessionID string) {
 func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 	if m.store == nil || auth == nil {
 		return nil
+	}
+	if errWeight := ValidateAuthWeight(auth); errWeight != nil {
+		return fmt.Errorf("persist auth: %w", errWeight)
 	}
 	if shouldSkipPersist(ctx) {
 		return nil

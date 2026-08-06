@@ -42,6 +42,7 @@ type rpcCapabilities struct {
 	UsagePlugin                   bool                         `json:"usage_plugin"`
 	CommandLinePlugin             bool                         `json:"command_line_plugin"`
 	ManagementAPI                 bool                         `json:"management_api"`
+	RequestLifecyclePlugin        bool                         `json:"request_lifecycle_plugin"`
 }
 
 type rpcIdentifierResponse struct {
@@ -119,6 +120,11 @@ type rpcManagementRegistrationResponse struct {
 	Resources []pluginapi.ResourceRoute   `json:"resources,omitempty"`
 }
 
+type rpcRequestCompletion struct {
+	pluginapi.RequestCompletion
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
 type rpcEmptyResponse struct{}
 
 func rpcCapabilitiesFromPlugin(plugin pluginapi.Plugin) rpcCapabilities {
@@ -147,6 +153,7 @@ func rpcCapabilitiesFromPlugin(plugin pluginapi.Plugin) rpcCapabilities {
 		UsagePlugin:                   caps.UsagePlugin != nil,
 		CommandLinePlugin:             caps.CommandLinePlugin != nil,
 		ManagementAPI:                 caps.ManagementAPI != nil,
+		RequestLifecyclePlugin:        caps.RequestLifecyclePlugin != nil,
 	}
 }
 

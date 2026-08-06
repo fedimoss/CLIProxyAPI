@@ -91,6 +91,20 @@ type handlerDirectExecutorRouteHost struct {
 	lastOptions  coreexecutor.Options
 }
 
+type handlerSkipAwareDirectExecutorRouteHost struct {
+	handlerDirectExecutorRouteHost
+	routeSkip string
+}
+
+func (h *handlerSkipAwareDirectExecutorRouteHost) RouteModelExcept(ctx context.Context, req pluginapi.ModelRouteRequest, skipPluginID string) (pluginapi.ModelRouteResponse, bool) {
+	h.routeSkip = skipPluginID
+	return pluginapi.ModelRouteResponse{}, false
+}
+
+func (h *handlerSkipAwareDirectExecutorRouteHost) HasModelRoutersExcept(string) bool {
+	return h != nil && h.hasRouters
+}
+
 func (h *handlerDirectExecutorRouteHost) ExecutePluginExecutor(ctx context.Context, pluginID string, req coreexecutor.Request, opts coreexecutor.Options) (coreexecutor.Response, error) {
 	h.lastPluginID = pluginID
 	h.lastRequest = req
@@ -455,6 +469,42 @@ func TestPrepareStreamModelRouteReusesDecisionDuringExecution(t *testing.T) {
 	}
 	if host.lastPluginID != targetPluginID {
 		t.Fatalf("plugin id = %q, want %q", host.lastPluginID, targetPluginID)
+	}
+}
+
+func TestExecuteModelStreamDoesNotReusePreparedRouteWhenRouterPluginSkipped(t *testing.T) {
+	const originalModel = "prepared-router-model"
+	const mappedModel = "mapped-upstream-model"
+	const originPluginID = "origin-plugin"
+	host := &handlerSkipAwareDirectExecutorRouteHost{}
+	host.hasRouters = true
+	host.route = func(context.Context, pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, bool) {
+		return pluginapi.ModelRouteResponse{Handled: true, TargetKind: pluginapi.ModelRouteTargetExecutor, Target: originPluginID}, true
+	}
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil)
+	handler.SetModelRouterHost(host)
+	body := []byte(`{"model":"prepared-router-model","stream":true}`)
+	ctx, routedToPlugin := handler.PrepareStreamModelRoute(context.Background(), "openai-response", originalModel, body)
+	if !routedToPlugin {
+		t.Fatal("PrepareStreamModelRoute() did not detect plugin executor route")
+	}
+
+	_, errMsg := handler.ExecuteModelStream(ctx, ModelExecutionRequest{
+		EntryProtocol:      "openai-response",
+		ExitProtocol:       "openai-response",
+		Model:              mappedModel,
+		Stream:             true,
+		Body:               []byte(`{"model":"mapped-upstream-model","stream":true}`),
+		SkipRouterPluginID: originPluginID,
+	})
+	if host.routeSkip != originPluginID {
+		t.Fatalf("router skip id = %q, want %q", host.routeSkip, originPluginID)
+	}
+	if host.lastPluginID == originPluginID {
+		t.Fatalf("plugin executor %q was re-entered despite SkipRouterPluginID", host.lastPluginID)
+	}
+	if errMsg == nil {
+		t.Fatal("ExecuteModelStream() error = nil, want normal provider resolution failure with empty auth manager")
 	}
 }
 
